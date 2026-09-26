@@ -335,7 +335,8 @@ fn tools() -> Vec<ToolInfo> {
             description: "Read a session's UI as structured data: widgets by id (role, state, \
                           accepted actions), layout, focus, open modal, commands, plus `instance` \
                           and `revision`. With `since` and `instance`, return only the changes after \
-                          that revision. If the application is not running, `status` says so.",
+                          that revision; far back, they come `merged: true` (replace / remove with \
+                          current values). If the application is not running, `status` says so.",
             input_schema: with_target(json!({
                 "type": "object",
                 "properties": {
