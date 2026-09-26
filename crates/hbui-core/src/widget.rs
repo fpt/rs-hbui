@@ -308,7 +308,92 @@ impl Input {
 /// the core only reports that it was pressed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Button {
+    /// May mark a hotkey with `&`, as in `&OK`.
     pub label: String,
+    /// The dialog's default: Enter anywhere in the modal presses it, as in
+    /// Midnight Commander. Drawn `[< OK >]`.
+    pub default: bool,
+}
+
+/// An on/off option. Drawn `[x] label`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Checkbox {
+    /// May mark a hotkey with `&`, as in `Show &hidden files`.
+    pub label: String,
+    pub checked: bool,
+}
+
+/// One choice out of several, all visible. Drawn `(*) item`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RadioGroup {
+    pub label: String,
+    pub items: Vec<Item>,
+    /// The chosen item's id.
+    pub selected: Option<String>,
+}
+
+impl RadioGroup {
+    pub fn new(label: impl Into<String>, items: Vec<Item>) -> Self {
+        let selected = items.first().map(|i| i.id.clone());
+        Self {
+            label: label.into(),
+            items,
+            selected,
+        }
+    }
+
+    pub fn select(&mut self, id: &str) -> bool {
+        if self.items.iter().any(|i| i.id == id) {
+            self.selected = Some(id.to_string());
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Split a label into what is shown and its hotkey: `&Copy` is shown `Copy`
+/// with hotkey `c`, and `&&` is a literal `&`. The hotkey is lowercase.
+pub fn hotkey(label: &str) -> (String, Option<char>) {
+    let mut shown = String::with_capacity(label.len());
+    let mut key = None;
+    let mut chars = label.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '&' {
+            match chars.next() {
+                Some('&') => shown.push('&'),
+                Some(k) => {
+                    if key.is_none() {
+                        key = Some(k.to_ascii_lowercase());
+                    }
+                    shown.push(k);
+                }
+                None => {}
+            }
+        } else {
+            shown.push(c);
+        }
+    }
+    (shown, key)
+}
+
+/// Where the hotkey sits in the shown label, in chars — for the renderer to
+/// mark it.
+pub fn hotkey_index(label: &str) -> Option<usize> {
+    let mut shown = 0;
+    let mut chars = label.chars();
+    while let Some(c) = chars.next() {
+        if c == '&' {
+            match chars.next() {
+                Some('&') => shown += 1,
+                Some(_) => return Some(shown),
+                None => return None,
+            }
+        } else {
+            shown += 1;
+        }
+    }
+    None
 }
 
 /// Read-only text, possibly several lines.
@@ -324,6 +409,8 @@ pub enum Widget {
     Tree(Tree),
     Input(Input),
     Button(Button),
+    Checkbox(Checkbox),
+    Radio(RadioGroup),
 }
 
 impl Widget {
@@ -336,7 +423,33 @@ impl Widget {
     pub fn button(label: impl Into<String>) -> Self {
         Widget::Button(Button {
             label: label.into(),
+            default: false,
         })
+    }
+
+    /// The button Enter presses from anywhere in its modal.
+    pub fn default_button(label: impl Into<String>) -> Self {
+        Widget::Button(Button {
+            label: label.into(),
+            default: true,
+        })
+    }
+
+    pub fn checkbox(label: impl Into<String>, checked: bool) -> Self {
+        Widget::Checkbox(Checkbox {
+            label: label.into(),
+            checked,
+        })
+    }
+
+    /// The `&` hotkey of a button or checkbox, if it has one.
+    pub fn hotkey(&self) -> Option<char> {
+        match self {
+            Widget::Button(Button { label, .. }) | Widget::Checkbox(Checkbox { label, .. }) => {
+                hotkey(label).1
+            }
+            _ => None,
+        }
     }
 
     /// The `role` an agent sees.
@@ -347,6 +460,8 @@ impl Widget {
             Widget::Tree(_) => "tree",
             Widget::Input(_) => "input",
             Widget::Button(_) => "button",
+            Widget::Checkbox(_) => "checkbox",
+            Widget::Radio(_) => "radio",
         }
     }
 
@@ -363,6 +478,8 @@ impl Widget {
             Widget::Tree(_) => &["focus", "select", "activate", "expand", "collapse"],
             Widget::Input(_) => &["focus", "set_text", "activate"],
             Widget::Button(_) => &["focus", "activate"],
+            Widget::Checkbox(_) => &["focus", "set_checked", "activate"],
+            Widget::Radio(_) => &["focus", "select"],
         }
     }
 }
@@ -422,5 +539,15 @@ mod tests {
         assert_eq!(l.selected.as_deref(), Some("a"));
         l.move_by(5);
         assert_eq!(l.selected.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn hotkeys_are_marked_with_an_ampersand() {
+        assert_eq!(hotkey("&Copy"), ("Copy".into(), Some('c')));
+        assert_eq!(hotkey("Show &Hidden"), ("Show Hidden".into(), Some('h')));
+        assert_eq!(hotkey("Save && quit"), ("Save & quit".into(), None));
+        assert_eq!(hotkey("plain"), ("plain".into(), None));
+        assert_eq!(hotkey_index("Show &Hidden"), Some(5));
+        assert_eq!(hotkey_index("A && &B"), Some(4));
     }
 }

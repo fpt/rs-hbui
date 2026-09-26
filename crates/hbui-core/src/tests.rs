@@ -351,3 +351,308 @@ fn get_view_since_merges_beyond_the_kept_views() {
     // A revision that never existed still gets the whole view.
     assert_eq!(s.view_since(10_000)["full"], true);
 }
+
+/// Midnight Commander-style menus and dialogs.
+mod mc {
+    use serde_json::json;
+
+    use crate::*;
+
+    /// A file list, a menu bar, and an Options dialog with a checkbox, a
+    /// radio group, an input and OK / Cancel. Copy is disabled while `..` is
+    /// selected, which `settle` keeps in step.
+    struct App {
+        applied: Vec<String>,
+    }
+
+    impl Controller for App {
+        fn handle(&mut self, ui: &mut UiState, event: &Event) -> Result<(), String> {
+            match event {
+                Event::Invoked { command } if command == "options" => ui.open_modal(
+                    "opts",
+                    "Options",
+                    vec![
+                        (
+                            "opts.hidden".into(),
+                            Widget::checkbox("Show &hidden", false),
+                        ),
+                        (
+                            "opts.sort".into(),
+                            Widget::Radio(RadioGroup::new(
+                                "Sort",
+                                vec![Item::new("name", "Name"), Item::new("size", "Size")],
+                            )),
+                        ),
+                        ("opts.mask".into(), Widget::Input(Input::new("Mask", "*"))),
+                        ("opts.ok".into(), Widget::default_button("&OK")),
+                        ("opts.cancel".into(), Widget::button("&Cancel")),
+                    ],
+                ),
+                Event::Activated { target, .. } if target == "opts.ok" => {
+                    let hidden =
+                        matches!(ui.widget("opts.hidden"), Some(Widget::Checkbox(c)) if c.checked);
+                    let sort = match ui.widget("opts.sort") {
+                        Some(Widget::Radio(r)) => r.selected.clone().unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                    let mask = ui.input("opts.mask").map(|i| i.buffer.text().to_string());
+                    self.applied.push(format!(
+                        "hidden={hidden} sort={sort} mask={}",
+                        mask.unwrap_or_default()
+                    ));
+                    ui.close_modal();
+                    ui.set_text("status", self.applied.last().unwrap().clone());
+                }
+                Event::Activated { target, .. } if target == "opts.cancel" => {
+                    ui.close_modal();
+                }
+                Event::Invoked { command } => ui.set_text("status", format!("ran {command}")),
+                _ => {}
+            }
+            Ok(())
+        }
+
+        fn settle(&mut self, ui: &mut UiState) {
+            let on_parent = matches!(ui.widget("files"), Some(Widget::List(l)) if l.selected.as_deref() == Some(".."));
+            ui.set_enabled("copy", !on_parent);
+        }
+    }
+
+    fn session() -> Session {
+        let mut ui = UiState::new(Layout::vsplit(vec![
+            (Size::Fill(1), Layout::pane("p", "Files", "files")),
+            (Size::Fixed(1), Layout::Widget("status".into())),
+        ]))
+        .with(
+            "files",
+            Widget::List(List::new(
+                "Files",
+                vec![Item::new("..", "../"), Item::new("a.txt", "a.txt")],
+            )),
+        )
+        .with("status", Widget::text(""));
+        ui.commands = vec![
+            Command::new("copy", "&Copy", Some(Key::F(5))),
+            Command::new("mkdir", "&Make directory", Some(Key::F(7))),
+            Command::new("options", "&Panel options...", None),
+        ];
+        ui.menus = vec![
+            Menu::new(
+                "file",
+                "&File",
+                vec![
+                    MenuItem::Command("copy".into()),
+                    MenuItem::Separator,
+                    MenuItem::Command("mkdir".into()),
+                ],
+            ),
+            Menu::new(
+                "options",
+                "&Options",
+                vec![MenuItem::Command("options".into())],
+            ),
+        ];
+        Session::new(
+            ui,
+            App {
+                applied: Vec::new(),
+            },
+        )
+    }
+
+    fn key(s: &mut Session, k: Key) {
+        s.input(&InputEvent::Key(k)).unwrap();
+    }
+
+    #[test]
+    fn the_view_lists_menus_and_dims_disabled_commands() {
+        let v = session().view();
+        assert_eq!(
+            v["menus"][0],
+            json!({"id": "file", "label": "File", "hotkey": "f", "items": ["copy", "-", "mkdir"]})
+        );
+        assert_eq!(v["menu"], json!(null));
+        // `..` is selected, so settle disabled Copy before the first view.
+        assert_eq!(
+            v["commands"][0],
+            json!({"id": "copy", "label": "Copy", "hotkey": "c", "key": "F5", "enabled": false})
+        );
+    }
+
+    #[test]
+    fn f9_pulls_down_a_menu_that_skips_what_cannot_be_chosen() {
+        let mut s = session();
+        key(&mut s, Key::F(9));
+        // Copy is disabled, so the highlight starts on mkdir.
+        assert_eq!(
+            s.view()["menu"],
+            json!({"menu": "file", "highlighted": "mkdir"})
+        );
+        key(&mut s, Key::Up);
+        assert_eq!(s.view()["menu"]["highlighted"], "mkdir");
+        key(&mut s, Key::Right);
+        assert_eq!(
+            s.view()["menu"],
+            json!({"menu": "options", "highlighted": "options"})
+        );
+        key(&mut s, Key::Right); // wraps
+        assert_eq!(s.view()["menu"]["menu"], "file");
+        key(&mut s, Key::Enter);
+        assert_eq!(s.view()["menu"], json!(null));
+        assert_eq!(s.view()["widgets"]["status"]["value"], "ran mkdir");
+    }
+
+    #[test]
+    fn letters_in_a_menu_choose_items_then_menus() {
+        let mut s = session();
+        key(&mut s, Key::F(9));
+        key(&mut s, Key::Char('o')); // no item "o" in File: the Options menu
+        assert_eq!(s.view()["menu"]["menu"], "options");
+        key(&mut s, Key::Char('p')); // "&Panel options..."
+        assert_eq!(s.view()["modal"]["id"], "opts");
+        assert_eq!(
+            s.view()["menu"],
+            json!(null),
+            "the dialog replaced the menu"
+        );
+    }
+
+    #[test]
+    fn disabled_commands_are_refused_and_their_keys_ignored() {
+        let mut s = session();
+        let err = s
+            .dispatch(
+                Action::Invoke {
+                    command: "copy".into(),
+                }
+                .into(),
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), "command_disabled");
+        key(&mut s, Key::F(5));
+        assert_eq!(s.view()["widgets"]["status"]["value"], "");
+        // Selecting a file enables it again.
+        key(&mut s, Key::Down);
+        assert!(s.view()["commands"][0].get("enabled").is_none());
+        key(&mut s, Key::F(5));
+        assert_eq!(s.view()["widgets"]["status"]["value"], "ran copy");
+    }
+
+    #[test]
+    fn an_agent_invoking_a_command_puts_the_persons_menu_away() {
+        let mut s = session();
+        key(&mut s, Key::F(9));
+        s.dispatch(
+            Action::Invoke {
+                command: "mkdir".into(),
+            }
+            .into(),
+        )
+        .unwrap();
+        assert_eq!(s.view()["menu"], json!(null));
+    }
+
+    /// A person fills the dialog with the keys Midnight Commander uses.
+    #[test]
+    fn a_person_fills_a_dialog() {
+        let mut s = session();
+        s.dispatch(
+            Action::Invoke {
+                command: "options".into(),
+            }
+            .into(),
+        )
+        .unwrap();
+        assert_eq!(s.view()["focus"], "opts.hidden");
+        key(&mut s, Key::Char(' ')); // toggle the checkbox
+        key(&mut s, Key::Down); // a checkbox has no use for Down: next widget
+        assert_eq!(s.view()["focus"], "opts.sort");
+        key(&mut s, Key::Down); // a radio group does: next choice
+        assert_eq!(s.view()["widgets"]["opts.sort"]["selected"], "size");
+        key(&mut s, Key::Tab);
+        assert_eq!(s.view()["focus"], "opts.mask");
+        key(&mut s, Key::Char('h')); // in a text field, a letter is text
+        assert_eq!(s.view()["widgets"]["opts.mask"]["value"], "*h");
+        key(&mut s, Key::Enter); // from the input: the default button
+        assert_eq!(
+            s.view()["widgets"]["status"]["value"],
+            "hidden=true sort=size mask=*h"
+        );
+    }
+
+    #[test]
+    fn hotkeys_press_buttons_and_toggle_checkboxes_outside_text_fields() {
+        let mut s = session();
+        s.dispatch(
+            Action::Invoke {
+                command: "options".into(),
+            }
+            .into(),
+        )
+        .unwrap();
+        key(&mut s, Key::Char('h'));
+        key(&mut s, Key::Char('h'));
+        key(&mut s, Key::Char('h'));
+        assert_eq!(s.view()["widgets"]["opts.hidden"]["checked"], true);
+        key(&mut s, Key::Char('c'));
+        assert_eq!(s.view()["modal"], json!(null));
+    }
+
+    /// An agent fills the same dialog with semantic actions only.
+    #[test]
+    fn an_agent_fills_a_dialog() {
+        let mut s = session();
+        let mut act = |a: Action| s.dispatch(a.into()).unwrap();
+        act(Action::Invoke {
+            command: "options".into(),
+        });
+        act(Action::SetChecked {
+            target: "opts.hidden".into(),
+            checked: true,
+        });
+        // Idempotent, unlike a toggle: twice is still on.
+        act(Action::SetChecked {
+            target: "opts.hidden".into(),
+            checked: true,
+        });
+        act(Action::Select {
+            target: "opts.sort".into(),
+            item: "size".into(),
+        });
+        act(Action::SetText {
+            target: "opts.mask".into(),
+            value: "*.rs".into(),
+        });
+        act(Action::Activate {
+            target: "opts.ok".into(),
+            item: None,
+        });
+        assert_eq!(
+            s.view()["widgets"]["status"]["value"],
+            "hidden=true sort=size mask=*.rs"
+        );
+    }
+
+    #[test]
+    fn the_dialog_view_names_the_default_button_and_hotkeys() {
+        let mut s = session();
+        s.dispatch(
+            Action::Invoke {
+                command: "options".into(),
+            }
+            .into(),
+        )
+        .unwrap();
+        let w = &s.view()["widgets"];
+        assert_eq!(
+            w["opts.ok"],
+            json!({"role": "button", "label": "OK", "hotkey": "o", "default": true, "actions": ["focus", "activate"]})
+        );
+        assert_eq!(
+            w["opts.hidden"],
+            json!({"role": "checkbox", "label": "Show hidden", "hotkey": "h", "checked": false,
+                   "actions": ["focus", "set_checked", "activate"]})
+        );
+        assert_eq!(w["opts.sort"]["role"], "radio");
+    }
+}

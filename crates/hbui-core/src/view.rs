@@ -6,8 +6,8 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::state::UiState;
-use crate::widget::{TreeNode, Widget};
+use crate::state::{MenuItem, UiState};
+use crate::widget::{hotkey, TreeNode, Widget};
 
 /// The view of `ui`, without its revision.
 ///
@@ -20,7 +20,7 @@ pub fn view_body(ui: &UiState) -> Value {
         .iter()
         .map(|(id, w)| (id.to_string(), widget_view(w)))
         .collect();
-    json!({
+    let mut v = json!({
         "focus": ui.focus(),
         "modal": ui.modal().map(|m| json!({
             "id": m.id,
@@ -29,14 +29,54 @@ pub fn view_body(ui: &UiState) -> Value {
         })),
         "layout": ui.layout.to_view(),
         "commands": ui.commands.iter().map(|c| {
-            let mut v = json!({ "id": c.id, "label": c.label });
+            let mut v = labelled(&c.label);
+            v["id"] = json!(c.id);
             if let Some(k) = c.key {
                 v["key"] = json!(k.to_string());
+            }
+            if !c.enabled {
+                v["enabled"] = json!(false);
             }
             v
         }).collect::<Vec<_>>(),
         "widgets": widgets,
-    })
+    });
+    // Only UIs with a menu bar say anything about menus.
+    if !ui.menus.is_empty() {
+        v["menus"] = json!(ui
+            .menus
+            .iter()
+            .map(|m| {
+                let mut v = labelled(&m.label);
+                v["id"] = json!(m.id);
+                v["items"] = json!(m
+                    .items
+                    .iter()
+                    .map(|i| match i {
+                        MenuItem::Command(id) => id.as_str(),
+                        MenuItem::Separator => "-",
+                    })
+                    .collect::<Vec<_>>());
+                v
+            })
+            .collect::<Vec<_>>());
+        v["menu"] = json!(ui.open_menu().map(|o| json!({
+            "menu": o.menu,
+            "highlighted": o.highlighted,
+        })));
+    }
+    v
+}
+
+/// A label as an agent reads it: without the `&` markup, and the hotkey
+/// beside it when there is one.
+fn labelled(label: &str) -> Value {
+    let (shown, key) = hotkey(label);
+    let mut v = json!({ "label": shown });
+    if let Some(k) = key {
+        v["hotkey"] = json!(k.to_string());
+    }
+    v
 }
 
 fn widget_view(w: &Widget) -> Value {
@@ -57,7 +97,23 @@ fn widget_view(w: &Widget) -> Value {
             "value": i.buffer.text(),
             "cursor": i.buffer.cursor().grapheme,
         }),
-        Widget::Button(b) => json!({ "label": b.label }),
+        Widget::Button(b) => {
+            let mut v = labelled(&b.label);
+            if b.default {
+                v["default"] = json!(true);
+            }
+            v
+        }
+        Widget::Checkbox(c) => {
+            let mut v = labelled(&c.label);
+            v["checked"] = json!(c.checked);
+            v
+        }
+        Widget::Radio(r) => json!({
+            "label": r.label,
+            "selected": r.selected,
+            "items": r.items.iter().map(|i| json!({ "id": i.id, "label": i.label })).collect::<Vec<_>>(),
+        }),
     };
     v["role"] = json!(w.role());
     if !w.actions().is_empty() {

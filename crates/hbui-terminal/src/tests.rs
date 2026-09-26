@@ -3,6 +3,7 @@
 use hbui_core::*;
 
 use crate::render::{render, SAFETY_MARGIN};
+use crate::surface::Color;
 
 fn commander() -> UiState {
     let mut ui = UiState::new(Layout::vsplit(vec![
@@ -129,4 +130,110 @@ fn the_input_cursor_keeps_its_distance_from_the_right_edge() {
         .all(|c| c.grapheme != "\u{fffd}"));
     let text = frame.surface.to_text();
     assert!(text.trim_end().ends_with("そ"), "{text:?}");
+}
+
+fn with_menus() -> UiState {
+    let mut ui = commander();
+    ui.commands = vec![
+        Command::new("copy", "&Copy", Some(Key::F(5))),
+        Command::new("mkdir", "&Make directory", Some(Key::F(7))),
+        Command::new("options", "&Panel options...", None),
+    ];
+    ui.set_enabled("copy", false);
+    ui.menus = vec![
+        Menu::new(
+            "file",
+            "&File",
+            vec![
+                MenuItem::Command("copy".into()),
+                MenuItem::Separator,
+                MenuItem::Command("mkdir".into()),
+            ],
+        ),
+        Menu::new(
+            "options",
+            "&Options",
+            vec![MenuItem::Command("options".into())],
+        ),
+    ];
+    ui
+}
+
+#[test]
+fn a_pulled_down_menu_lies_over_the_panes() {
+    let mut ui = with_menus();
+    ui.pull_down("file");
+    let frame = render(&ui, 40, 9);
+    assert_eq!(
+        frame.surface.to_text(),
+        "  File   Options\n\
+┌┌─────────────────────┐── Right ──────┐
+││ Copy             F5 │tmp            │
+│├─────────────────────┤               │
+││ Make directory   F7 │               │
+│└─────────────────────┘               │
+└──────────────────┘└──────────────────┘
+ready
+F5 Copy  F7 Make directory
+"
+    );
+    let s = &frame.surface;
+    // Copy is disabled: dimmed, and the highlight skipped it.
+    assert_eq!(s.cell(3, 2).style.fg, Color::Grey);
+    assert!(s.cell(3, 4).style.reverse, "Make directory is highlighted");
+    // The hotkey of "File" is marked.
+    assert!(s.cell(2, 0).style.underline);
+    assert_eq!(frame.cursor, None);
+}
+
+#[test]
+fn a_dialog_with_every_kind_of_field() {
+    let mut ui = commander();
+    ui.open_modal(
+        "opts",
+        "Options",
+        vec![
+            ("opts.hidden".into(), Widget::checkbox("Show &hidden", true)),
+            (
+                "opts.sort".into(),
+                Widget::Radio(RadioGroup::new(
+                    "Sort",
+                    vec![Item::new("name", "Name"), Item::new("size", "Size")],
+                )),
+            ),
+            (
+                "opts.mask".into(),
+                Widget::Input(Input::new("Mask", "*.rs")),
+            ),
+            ("opts.ok".into(), Widget::default_button("&OK")),
+            ("opts.cancel".into(), Widget::button("&Cancel")),
+        ],
+    );
+    let frame = render(&ui, 44, 18);
+    assert_eq!(
+        frame.surface.to_text(),
+        "\
+┌─────── Left ───────┐┌────── Right ───────┐
+│> Documents         ││> /tmp              │
+│ ┌────────────── Options ───────────────┐ │
+│ │                                      │ │
+│ │ [x] Show hidden                      │ │
+│ │                                      │ │
+│ │ Sort:                                │ │
+│ │ (*) Name                             │ │
+│ │ ( ) Size                             │ │
+│ │                                      │ │
+│ │ Mask: *.rs                           │ │
+│ │                                      │ │
+│ │ [< OK >]  [ Cancel ]                 │ │
+│ │                                      │ │
+│ └──────────────────────────────────────┘ │
+└────────────────────┘└────────────────────┘
+ready
+F5 Copy  F6 Move
+"
+    );
+    // The checkbox has focus; the text field does not, so no cursor.
+    assert!(frame.surface.cell(4, 4).style.reverse);
+    assert_eq!(frame.cursor, None);
 }

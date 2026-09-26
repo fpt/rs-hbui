@@ -155,7 +155,16 @@ fn the_agent_outlives_the_application() {
                "expected_instance": 1, "expected_revision": revision}),
     );
     assert!(!err, "{out}");
-    assert_eq!(out["changes"][0]["path"], "/widgets/left.files/selected");
+    // Selecting a file also enables Rename and Copy, so it is not the only
+    // change — but it is one of them.
+    assert!(
+        out["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["path"] == "/widgets/left.files/selected"),
+        "{out}"
+    );
 
     // A second agent's bridge sees the same application, and the change.
     let second = Server::new(Bridge::new(&dir), "test");
