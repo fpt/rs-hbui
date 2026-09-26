@@ -197,6 +197,20 @@ hbui_terminal::run(&shared)?;
 
 The link is a Unix socket, so macOS and Linux only for now.
 
+## Skills
+
+Two reusable agent skills:
+
+- [`skills/hbui-building`](skills/hbui-building/SKILL.md) covers writing a UI
+  with hbui: layout, widgets, commands and menus, dialogs, the `Controller`,
+  and opening a session.
+- [`skills/hbui-driving`](skills/hbui-driving/SKILL.md) covers operating a
+  running app through the MCP tools: reading the view, semantic actions,
+  dialogs, errors, and working alongside a person.
+
+`crates/commander/examples/todo.rs` is the smallest complete program:
+`cargo run -p hbui-commander --example todo`.
+
 ## Development
 
 ```bash
