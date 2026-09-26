@@ -1,7 +1,7 @@
 PREFIX ?= $(HOME)
 CARGO  ?= cargo
 
-.PHONY: build release test lint fmt fmt-check check bridge run install clean
+.PHONY: build release test lint fmt fmt-check check run install clean
 
 build:
 	cd crates && $(CARGO) build
@@ -28,11 +28,9 @@ check: test lint fmt-check
 
 DIR ?= .
 
-# The long-lived half: MCP on 127.0.0.1:8740/mcp. Leave it running.
-bridge: build
-	./crates/target/debug/hbui-mcp-bridge --http
-
-# The short-lived half: restart it as often as you like; it reconnects.
+# The application, in session "commander". Restart it as often as you like.
+# Agents reach it through the bridge, registered once with
+#   claude mcp add hbui -- $$PWD/crates/target/debug/hbui-mcp-bridge
 run: build
 	./crates/target/debug/commander $(DIR)
 

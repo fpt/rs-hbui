@@ -1,8 +1,9 @@
-//! The success scenario of `docs/MCP_BRIDGE.md`, end to end.
+//! The success scenario of `docs/MCP_BRIDGE.md`, with sessions, end to end.
 //!
-//! A real bridge runs in this process — one `Server`, standing in for one
-//! MCP connection that is never re-established — while real `commander`
-//! processes are started, killed and restarted behind it.
+//! Real `commander` processes are started, killed and restarted. A bridge
+//! runs in this process — one `Server`, standing in for one MCP connection
+//! that is never re-established — and a second bridge stands in for a second
+//! agent watching the same applications.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -12,15 +13,21 @@ use hbui_ipc::Bridge;
 use hbui_mcp_bridge::Server;
 use serde_json::{json, Value};
 
+/// A session directory and a directory of files, removed on drop. Short, for
+/// the socket-path limit.
 struct Scratch(PathBuf);
 
 impl Scratch {
     fn new() -> Self {
-        let p = std::env::temp_dir().join(format!("hbui-lifecycle-{}", std::process::id()));
+        let p = std::env::temp_dir().join(format!("hbui-lc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(p.join("files/docs")).unwrap();
         std::fs::write(p.join("files/notes.txt"), "hi").unwrap();
         Self(p)
+    }
+
+    fn sessions(&self) -> PathBuf {
+        self.0.join("s")
     }
 }
 
@@ -34,16 +41,19 @@ impl Drop for Scratch {
 struct App(Child);
 
 impl App {
-    fn start(socket: &Path, dir: &Path) -> Self {
+    fn start(sessions: &Path, session: &str, dir: &Path) -> Self {
         let child = Command::new(env!("CARGO_BIN_EXE_commander"))
-            .arg("--headless")
-            .arg("--socket")
-            .arg(socket)
+            .env("HBUI_DIR", sessions)
+            .args(["--headless", "--hbui-session", session])
             .arg(dir)
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
         Self(child)
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
     }
 
     fn kill(mut self) {
@@ -76,6 +86,20 @@ fn tool(server: &Server, name: &str, args: Value) -> (bool, Value) {
     )
 }
 
+fn sessions(server: &Server) -> Vec<Value> {
+    tool(server, "list_sessions", json!({})).1["sessions"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+fn status(server: &Server, session: &str) -> Value {
+    sessions(server)
+        .into_iter()
+        .find(|s| s["session"] == session)
+        .map_or(Value::Null, |s| s["status"].clone())
+}
+
 fn until(what: &str, mut f: impl FnMut() -> bool) {
     let start = Instant::now();
     while !f() {
@@ -90,60 +114,72 @@ fn until(what: &str, mut f: impl FnMut() -> bool) {
 #[test]
 fn the_agent_outlives_the_application() {
     let scratch = Scratch::new();
-    let dir = scratch.0.join("files");
-    let socket = scratch.0.join("bridge.sock");
+    let files = scratch.0.join("files");
+    let dir = scratch.sessions();
 
     // 1. The agent's connection: one bridge, one server, for the whole test.
-    let server = Server::new(Bridge::listen(&socket).unwrap(), "test");
-    let status = |s: &Server| tool(s, "get_view", json!({})).1["status"].clone();
-    assert_eq!(status(&server), "application_unavailable");
+    let bridge = Bridge::new(&dir);
+    bridge.watch();
+    let server = Server::new(bridge, "test");
+    assert!(sessions(&server).is_empty());
 
-    // 2. The application connects.
-    let app = App::start(&socket, &dir);
-    until("first instance", || status(&server) == "ready");
+    // 2. Two applications, each in its own session.
+    let app = App::start(&dir, "main", &files);
+    let _other = App::start(&dir, "other", &files);
+    until("both sessions", || {
+        status(&server, "main") == "ready" && status(&server, "other") == "ready"
+    });
+    let row = sessions(&server)
+        .into_iter()
+        .find(|s| s["session"] == "main")
+        .unwrap();
+    assert_eq!(row["application"], "commander");
+    assert_eq!(row["pid"], app.pid());
+    assert_eq!(row["instance"], 1);
 
-    // 3. get_view.
-    let (_, view) = tool(&server, "get_view", json!({}));
-    let instance = view["instance"].as_u64().unwrap();
-    let revision = view["revision"].as_u64().unwrap();
-    assert_eq!(instance, 1);
-    let items: Vec<&str> = view["widgets"]["left.files"]["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|i| i["id"].as_str().unwrap())
-        .collect();
-    assert!(items.contains(&"notes.txt"), "{items:?}");
+    // 3. get_view, by session and by pid.
+    let (_, view) = tool(&server, "get_view", json!({"session": "main"}));
+    assert_eq!(
+        (view["session"].clone(), view["instance"].clone()),
+        (json!("main"), json!(1))
+    );
+    let (_, by_pid) = tool(&server, "get_view", json!({"pid": app.pid()}));
+    assert_eq!(by_pid["session"], "main");
+    let revision = view["revision"].clone();
 
     // 4. dispatch.
     let (err, out) = tool(
         &server,
         "dispatch",
-        json!({"type": "select", "target": "left.files", "item": "notes.txt",
-               "expected_instance": instance, "expected_revision": revision}),
+        json!({"session": "main", "type": "select", "target": "left.files", "item": "notes.txt",
+               "expected_instance": 1, "expected_revision": revision}),
     );
     assert!(!err, "{out}");
-    assert_eq!(out["instance"], 1);
     assert_eq!(out["changes"][0]["path"], "/widgets/left.files/selected");
 
-    // 5. The application goes away — killed, as a crash would.
+    // A second agent's bridge sees the same application, and the change.
+    let second = Server::new(Bridge::new(&dir), "test");
+    let (_, seen) = tool(&second, "get_view", json!({"session": "main"}));
+    assert_eq!(seen["widgets"]["left.files"]["selected"], "notes.txt");
+
+    // 5. The application goes away — killed, as a crash would. (First let
+    // its pushes catch up: the second bridge attaching changed its status
+    // line, so the revision may already be past `before`.)
     let before = out["revision"].as_u64().unwrap();
     until("the pushed view to catch up", || {
-        server
-            .bridge()
-            .status()
-            .snapshot
-            .is_some_and(|s| s.view["revision"] == before)
+        sessions(&server)
+            .into_iter()
+            .any(|s| s["session"] == "main" && s["revision"].as_u64() >= Some(before))
     });
     app.kill();
 
-    // 6-7. The MCP side still answers, and says the application is gone,
-    // with its last state marked stale.
-    until("disconnect", || {
-        status(&server) == "application_disconnected"
-    });
-    let (err, down) = tool(&server, "get_view", json!({}));
+    // 6-7. The MCP side still answers, says the application is gone, and
+    // shows its last state marked stale. The other session is untouched.
+    until("disconnect", || status(&server, "main") == "disconnected");
+    assert_eq!(status(&server, "other"), "ready");
+    let (err, down) = tool(&server, "get_view", json!({"session": "main"}));
     assert!(!err, "an absent application is not a tool failure");
+    assert_eq!(down["status"], "application_disconnected");
     assert_eq!(down["stale"], true);
     assert_eq!(down["last_view"]["instance"], 1);
     assert_eq!(
@@ -153,26 +189,32 @@ fn the_agent_outlives_the_application() {
     let (err, refused) = tool(
         &server,
         "dispatch",
-        json!({"type": "focus", "target": "left.files"}),
+        json!({"session": "main", "type": "focus", "target": "left.files"}),
     );
     assert!(err);
     assert_eq!(refused["error"], "application_disconnected");
 
-    // 8-10. A new build starts, reconnects by itself, as a new instance.
-    let _app = App::start(&socket, &dir);
-    until("second instance", || status(&server) == "ready");
-    let (_, view) = tool(&server, "get_view", json!({}));
+    // 8-10. A new build starts under the same session and is found by
+    // itself, as a new instance with a new pid.
+    let app = App::start(&dir, "main", &files);
+    until("second instance", || status(&server, "main") == "ready");
+    let (_, view) = tool(&server, "get_view", json!({"session": "main"}));
     assert_eq!(view["instance"], 2);
+    let row = sessions(&server)
+        .into_iter()
+        .find(|s| s["session"] == "main")
+        .unwrap();
+    assert_eq!(row["pid"], app.pid());
 
     // 11. Everything works again, on the same MCP connection.
     let (err, out) = tool(
         &server,
         "dispatch",
-        json!({"type": "activate", "target": "left.files", "item": "docs",
+        json!({"session": "main", "type": "activate", "target": "left.files", "item": "docs",
                "expected_instance": 2, "expected_revision": view["revision"]}),
     );
     assert!(!err, "{out}");
-    let (_, view) = tool(&server, "get_view", json!({}));
+    let (_, view) = tool(&server, "get_view", json!({"session": "main"}));
     assert!(
         view["layout"].to_string().contains("files/docs"),
         "the pane moved into docs: {}",
@@ -183,12 +225,22 @@ fn the_agent_outlives_the_application() {
     let (err, stale) = tool(
         &server,
         "dispatch",
-        json!({"type": "select", "target": "left.files", "item": "notes.txt",
+        json!({"session": "main", "type": "select", "target": "left.files", "item": "notes.txt",
                "expected_instance": 1, "expected_revision": before}),
     );
     assert!(err);
     assert_eq!(stale["error"], "stale_instance");
     assert_eq!(stale["current_instance"], 2);
+
+    // A session name held by a live process cannot be taken twice.
+    let taken = Command::new(env!("CARGO_BIN_EXE_commander"))
+        .env("HBUI_DIR", &dir)
+        .args(["--headless", "--hbui-session", "main"])
+        .arg(&files)
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!taken.success());
 
     // 13. Nothing on the agent's side was restarted: every call above went
     // through the one `server` made in step 1.

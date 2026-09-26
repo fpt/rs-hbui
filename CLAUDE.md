@@ -2,11 +2,13 @@
 
 hbui ("half-breed UI") is a UI library that a person and an AI agent drive at
 the same time. A single `UiState` is the source of truth. `hbui-terminal` draws
-it for the person. The agent reaches it through `hbui-mcp-bridge`, a separate
-long-lived process that forwards over `hbui-ipc` to the application, so the
-application can restart without the agent reconnecting. The design rationale
-is in `docs/DESIGN.md` and `docs/MCP_BRIDGE.md` (both Japanese). Read them
-before changing anything structural.
+it for the person. Each application claims a named session (a socket in the
+session dir). Agents reach sessions through `hbui-mcp-bridge`, a stdio MCP
+server that finds every session by itself, so applications can restart
+without the agent reconnecting. The design rationale is in `docs/DESIGN.md`,
+`docs/MCP_BRIDGE.md` and `docs/SESSIONS.md` (all Japanese; SESSIONS.md takes
+precedence over MCP_BRIDGE.md where they differ). Read them before changing
+anything structural.
 
 ## Layout
 
@@ -14,13 +16,14 @@ before changing anything structural.
 crates/                 cargo workspace (run cargo from here, or use the Makefile)
   hbui-core/            state, widgets, layout, actions, keymap, session, view, diff
   hbui-terminal/        Surface, render, diff writer, TerminalGuard, crossterm input
-  hbui-ipc/             app <-> bridge link: Unix socket, JSON lines, handshake, instances
-                        (app side: Endpoint; bridge side: Bridge)
-  hbui-mcp-bridge/      MCP server binary: wire, tools, stdio, HTTP; forwards over hbui-ipc
+  hbui-ipc/             sessions: per-session socket + lock, JSON lines, handshake
+                        (app side: Endpoint, listens; bridge side: Bridge, scans)
+  hbui-mcp-bridge/      stdio MCP server binary: wire, tools; forwards over hbui-ipc
   commander/            two-pane file browser PoC (binary `commander`)
     tests/bridge_lifecycle.rs   the MCP_BRIDGE.md success scenario, with real processes
 docs/DESIGN.md          the design
 docs/MCP_BRIDGE.md      the bridge and the development lifecycle
+docs/SESSIONS.md        several applications: sessions, instances, pids
 ```
 
 Dependencies point only downward. `hbui-core` knows nothing of terminals,
@@ -76,26 +79,35 @@ committing.
 - **The application is never an MCP server.** MCP (transports, init,
   protocol versions) lives only in the bridge, and the application only speaks
   `hbui-ipc`. The bridge owns no UI state; it forwards and labels.
-- **A revision only means something within its instance.** The bridge
-  numbers each accepted connection (`instance`), and every view and outcome
-  carries it. `expected_instance` is checked against the same connection the
-  request is then sent on. `get_view since` is honoured only with a matching
-  `instance`.
+- **Session, instance and pid are separate.** `session` is the logical
+  application and the socket name. `instance` counts that session's runs;
+  it is kept in `<session>.lock` so every bridge sees the same number. `pid`
+  is only a selector. A revision only means something within its instance,
+  so `get_view since` is honoured only with a matching `instance`.
+  `expected_instance` is checked against the same connection the request is
+  then sent on.
+- **No current session.** Every MCP call except `list_sessions` names its
+  `session` (or `pid`). Do not add a "select session" tool.
+- **Apps listen, bridges scan.** An app claims a session by holding
+  `<session>.lock` (`File::try_lock`), which the kernel releases however the
+  process dies, and binds `<session>.sock`. Bridges scan the dir, and several
+  may be connected to one app, each getting the same answers and pushes.
 - **An absent application is a result, not a failure.** `get_view` returns
-  `status: application_unavailable | application_disconnected |
-  protocol_mismatch` as a normal tool result. The last pushed view is returned
+  `status: application_disconnected | protocol_mismatch` as a normal tool
+  result. The last pushed view is returned
   only as `last_view` with `stale: true`. If an app dies mid-`dispatch`, the
   reply is `outcome: "unknown"`, never a claim that the action wasn't applied.
-- **The application's link never blocks or fails the application.**
-  `Endpoint` retries in the background, and a newer connection replaces an
-  older one on the bridge.
+- **Bridges never block the application.** Everything runs on the endpoint's
+  threads; only an explicitly requested session name that is taken fails
+  startup.
 - **Bump `hbui_ipc::VERSION` on any incompatible IPC change.** Mismatches are
   refused by name (`protocol_mismatch`).
 - **Keep socket paths short.** Unix socket paths are limited to about 104
   bytes on macOS, so keep sockets in the system temp dir and not in deep
   scratch directories.
-- **MCP stdio: stdout is the protocol.** Diagnostics go to stderr only. HTTP
-  binds 127.0.0.1 and rejects non-local `Origin`. The IPC socket is mode 0600.
+- **The bridge speaks stdio MCP only, so stdout is the protocol.**
+  Diagnostics go to stderr only. The session dir is mode 0700 and the sockets
+  0600.
 - Tool refusals are tool results with `isError: true` and a stable `error`
   code (`ActionError::code`). JSON-RPC errors are only for protocol faults.
 
@@ -106,8 +118,9 @@ committing.
   (`hbui-terminal/src/tests.rs`). When a rendering change is intentional,
   update the expected text, and look at it before you do.
 - Commander tests run against a scratch directory under the system temp dir.
-- `commander/tests/bridge_lifecycle.rs` runs a bridge in-process against real
-  `commander --headless` processes, killing and restarting them. Any change to
+- `commander/tests/bridge_lifecycle.rs` runs bridges in-process against real
+  `commander --headless` processes in two sessions, killing and restarting
+  them. Any change to
   the bridge, IPC or instance semantics must keep it passing.
 
 ## Adding things

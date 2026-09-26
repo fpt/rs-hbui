@@ -1,5 +1,5 @@
 use std::io::BufReader;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -9,8 +9,22 @@ use serde_json::json;
 use crate::protocol::{read_line, write_line};
 use crate::*;
 
-fn socket(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("hbui-ipc-{name}-{}.sock", std::process::id()))
+/// A fresh session directory, removed on drop. Short, for the socket-path
+/// limit.
+struct Dir(PathBuf);
+
+impl Dir {
+    fn new(name: &str) -> Self {
+        let p = std::env::temp_dir().join(format!("hbui-t-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        Self(p)
+    }
+}
+
+impl Drop for Dir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 fn shared() -> Shared {
@@ -24,7 +38,6 @@ fn shared() -> Shared {
     Shared::new(Session::new(ui, NoController))
 }
 
-/// Poll until `f` holds, or fail after a couple of seconds.
 fn eventually(what: &str, mut f: impl FnMut() -> bool) {
     let start = Instant::now();
     while !f() {
@@ -36,20 +49,39 @@ fn eventually(what: &str, mut f: impl FnMut() -> bool) {
     }
 }
 
-#[test]
-fn an_application_connects_and_answers() {
-    let path = socket("answers");
-    let bridge = Bridge::listen(&path).unwrap();
-    let app = shared();
-    Endpoint::new(app.clone(), &path, "test").spawn();
-    eventually("connection", || bridge.status().connected.is_some());
+fn status(bridge: &Bridge, session: &str) -> Option<&'static str> {
+    bridge
+        .list()
+        .into_iter()
+        .find(|s| s.session == session)
+        .map(|s| s.status)
+}
 
-    let (instance, view) = bridge.request(None, "get_view", json!({})).unwrap();
+#[test]
+fn a_bridge_finds_an_application_and_forwards_to_it() {
+    let dir = Dir::new("forward");
+    let app = shared();
+    let running = Endpoint::new(app.clone(), "test")
+        .dir(&dir.0)
+        .start()
+        .unwrap();
+    assert_eq!((running.session.as_str(), running.instance), ("test", 1));
+
+    let bridge = Bridge::new(&dir.0);
+    bridge.scan();
+    let info = &bridge.list()[0];
+    assert_eq!(
+        (info.session.as_str(), info.status, info.pid),
+        ("test", "ready", std::process::id())
+    );
+
+    let (instance, view) = bridge.request("test", None, "get_view", json!({})).unwrap();
     assert_eq!(instance, 1);
     assert_eq!(view.unwrap()["widgets"]["files"]["selected"], "a");
 
     let (_, out) = bridge
         .request(
+            "test",
             Some(1),
             "dispatch",
             json!({"type": "select", "target": "files", "item": "b", "expected_revision": 0}),
@@ -58,9 +90,9 @@ fn an_application_connects_and_answers() {
     assert_eq!(out.unwrap()["revision"], 1);
     assert_eq!(app.lock().view()["widgets"]["files"]["selected"], "b");
 
-    // Refusals come back as the application's error, not a transport error.
     let (_, out) = bridge
         .request(
+            "test",
             None,
             "dispatch",
             json!({"type": "select", "target": "files", "item": "zz"}),
@@ -69,20 +101,83 @@ fn an_application_connects_and_answers() {
     assert_eq!(out.unwrap_err()["error"], "unknown_item");
 
     assert_eq!(
-        bridge.request(Some(9), "get_view", json!({})),
+        bridge.request("test", Some(9), "get_view", json!({})),
         Err(RequestError::StaleInstance { current: 1 })
+    );
+    assert_eq!(
+        bridge.request("nope", None, "get_view", json!({})),
+        Err(RequestError::UnknownSession)
+    );
+    assert_eq!(
+        bridge.resolve(&Target::Pid(std::process::id())),
+        Some("test".into())
     );
 }
 
 #[test]
-fn the_bridge_keeps_the_last_pushed_view() {
-    let path = socket("snapshot");
-    let bridge = Bridge::listen(&path).unwrap();
+fn sessions_are_claimed_once_and_named_after_the_application() {
+    let dir = Dir::new("claim");
+    let first = Endpoint::new(shared(), "app").dir(&dir.0).start().unwrap();
+    let second = Endpoint::new(shared(), "app").dir(&dir.0).start().unwrap();
+    assert_eq!(first.session, "app");
+    assert_eq!(second.session, "app-2");
+
+    let taken = Endpoint::new(shared(), "other")
+        .session("app")
+        .dir(&dir.0)
+        .start()
+        .err()
+        .unwrap();
+    assert_eq!(taken.kind(), std::io::ErrorKind::AddrInUse);
+
+    // Released and reclaimed: the same session, the next instance.
+    drop(first);
+    let again = Endpoint::new(shared(), "app")
+        .session("app")
+        .dir(&dir.0)
+        .start()
+        .unwrap();
+    assert_eq!((again.session.as_str(), again.instance), ("app", 2));
+}
+
+#[test]
+fn several_bridges_serve_one_application() {
+    let dir = Dir::new("multi");
     let app = shared();
-    Endpoint::new(app.clone(), &path, "test").spawn();
-    eventually("connection", || bridge.status().connected.is_some());
+    let _running = Endpoint::new(app.clone(), "test")
+        .dir(&dir.0)
+        .start()
+        .unwrap();
+    let (a, b) = (Bridge::new(&dir.0), Bridge::new(&dir.0));
+    a.scan();
+    b.scan();
+    a.request(
+        "test",
+        None,
+        "dispatch",
+        json!({"type": "select", "target": "files", "item": "b"}),
+    )
+    .unwrap()
+    .1
+    .unwrap();
+    let (_, view) = b.request("test", None, "get_view", json!({})).unwrap();
+    assert_eq!(view.unwrap()["widgets"]["files"]["selected"], "b");
+}
+
+#[test]
+fn the_bridge_keeps_the_view_the_application_pushes() {
+    let dir = Dir::new("snapshot");
+    let app = shared();
+    let _running = Endpoint::new(app.clone(), "test")
+        .dir(&dir.0)
+        .start()
+        .unwrap();
+    let bridge = Bridge::new(&dir.0);
+    bridge.scan();
 
     // A person's change, which the bridge never asked about, still arrives.
+    // (What happens when the process then dies is covered, with a real
+    // process, by commander's bridge_lifecycle test.)
     app.lock()
         .dispatch(
             Action::Select {
@@ -92,47 +187,38 @@ fn the_bridge_keeps_the_last_pushed_view() {
             .into(),
         )
         .unwrap();
-    eventually("the pushed view", || {
-        bridge
-            .status()
-            .snapshot
-            .is_some_and(|s| s.view["widgets"]["files"]["selected"] == "b")
-    });
+    eventually("the pushed view", || bridge.list()[0].revision == Some(1));
 }
 
 #[test]
 fn a_mismatched_application_is_refused_by_name() {
-    let path = socket("mismatch");
-    let bridge = Bridge::listen(&path).unwrap();
-    let stream = UnixStream::connect(&path).unwrap();
-    let mut hello = Hello::new("future");
-    hello.version = VERSION + 1;
-    write_line(&mut &stream, &hello).unwrap();
-    let welcome = read_line(&mut BufReader::new(&stream)).unwrap().unwrap();
+    let dir = Dir::new("mismatch");
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let listener = UnixListener::bind(socket_path(&dir.0, "future")).unwrap();
+    let fake = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let hello = Hello {
+            protocol: PROTOCOL.into(),
+            version: VERSION + 1,
+            application: "future".into(),
+            session: "future".into(),
+            instance: 1,
+            pid: 1,
+            cwd: String::new(),
+        };
+        write_line(&mut &stream, &hello).unwrap();
+        read_line(&mut BufReader::new(&stream)).unwrap().unwrap()
+    });
+    let bridge = Bridge::new(&dir.0);
+    bridge.scan();
+    let welcome = fake.join().unwrap();
     assert_eq!(welcome["accepted"], false);
     assert_eq!(welcome["error"], "protocol_mismatch");
-    assert_eq!(welcome["bridge_version"], VERSION);
+    assert_eq!(status(&bridge, "future"), Some("protocol_mismatch"));
     assert_eq!(
-        bridge.status().mismatch,
-        Some(Mismatch {
+        bridge.request("future", None, "get_view", json!({})),
+        Err(RequestError::Mismatch {
             application_version: VERSION + 1
         })
     );
-    assert_eq!(
-        bridge.request(None, "get_view", json!({})),
-        Err(RequestError::Unavailable)
-    );
-}
-
-#[test]
-fn a_live_bridge_is_not_replaced_but_a_dead_one_is() {
-    let path = socket("twice");
-    let first = Bridge::listen(&path).unwrap();
-    let err = Bridge::listen(&path).err().unwrap();
-    assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
-    // A stale file with nobody behind it is cleaned up.
-    std::mem::forget(first); // keep the file, as a crash would
-    let stale = socket("stale");
-    std::os::unix::net::UnixListener::bind(&stale).unwrap(); // bound, then dropped
-    Bridge::listen(&stale).unwrap();
 }

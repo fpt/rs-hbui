@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "A long-lived MCP server that forwards get_view / dispatch / capture_view to whichever hbui application is connected, so the application can restart without the agent reconnecting."
+description = "A stdio MCP server that finds every hbui application in the session directory and forwards list_sessions / get_view / dispatch / capture_view to the session each call names, so applications can restart without the agent reconnecting."
 
 [[bin]]
 name = "hbui-mcp-bridge"

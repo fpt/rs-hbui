@@ -1,17 +1,28 @@
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
 
 use hbui_core::*;
-use hbui_ipc::{Bridge, Endpoint};
+use hbui_ipc::{Bridge, Endpoint, Running};
 use serde_json::{json, Value};
 
 use crate::{stdio, Server};
 
-fn socket(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("hbui-bridge-{name}-{}.sock", std::process::id()))
+struct Dir(PathBuf);
+
+impl Dir {
+    fn new(name: &str) -> Self {
+        let p = std::env::temp_dir().join(format!("hbui-b-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        Self(p)
+    }
 }
 
-fn app() -> Shared {
+impl Drop for Dir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn app(dir: &Dir, session: &str) -> (Shared, Running) {
     let ui = UiState::new(Layout::pane("left", "Left", "files")).with(
         "files",
         Widget::List(List::new(
@@ -19,20 +30,13 @@ fn app() -> Shared {
             vec![Item::new("a", "a.txt"), Item::new("b", "b.txt")],
         )),
     );
-    Shared::new(Session::new(ui, NoController))
-}
-
-fn server(name: &str) -> Server {
-    Server::new(Bridge::listen(socket(name)).unwrap(), "0")
-}
-
-fn connect(server: &Server, app: &Shared) {
-    Endpoint::new(app.clone(), server.bridge().path(), "test").spawn();
-    let start = Instant::now();
-    while server.bridge().status().connected.is_none() {
-        assert!(start.elapsed() < Duration::from_secs(3), "no connection");
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let shared = Shared::new(Session::new(ui, NoController));
+    let running = Endpoint::new(shared.clone(), "test")
+        .session(session)
+        .dir(&dir.0)
+        .start()
+        .unwrap();
+    (shared, running)
 }
 
 /// Run a stdio session and return one parsed response per line.
@@ -57,16 +61,18 @@ fn tool_json(response: &Value) -> Value {
 
 #[test]
 fn initialize_and_list_work_with_no_application() {
+    let dir = Dir::new("init");
     let r = session(
-        &server("init"),
+        &Server::new(Bridge::new(&dir.0), "0"),
         &[
             json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}}),
             json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
             json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
-            call(3, "get_view", json!({})),
+            call(3, "list_sessions", json!({})),
+            call(4, "get_view", json!({})),
         ],
     );
-    assert_eq!(r.len(), 3, "a notification gets no reply");
+    assert_eq!(r.len(), 4, "a notification gets no reply");
     assert_eq!(r[0]["result"]["protocolVersion"], "2025-03-26");
     let names: Vec<&str> = r[1]["result"]["tools"]
         .as_array()
@@ -74,75 +80,105 @@ fn initialize_and_list_work_with_no_application() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["get_view", "dispatch", "capture_view"]);
-    // Not an error: the bridge is fine, the application is simply absent.
-    assert!(r[2]["result"].get("isError").is_none());
-    assert_eq!(tool_json(&r[2])["status"], "application_unavailable");
+    assert_eq!(
+        names,
+        ["list_sessions", "get_view", "dispatch", "capture_view"]
+    );
+    assert_eq!(tool_json(&r[2]), json!({"sessions": []}));
+    assert_eq!(r[3]["result"]["isError"], true);
+    assert_eq!(tool_json(&r[3])["error"], "session_required");
 }
 
 #[test]
-fn views_and_actions_carry_the_instance() {
-    let server = server("instance");
-    connect(&server, &app());
+fn every_call_names_its_session() {
+    let dir = Dir::new("sessions");
+    let (left, _l) = app(&dir, "left");
+    let (_right, _r) = app(&dir, "right");
+    let server = Server::new(Bridge::new(&dir.0), "0");
     let r = session(
         &server,
         &[
-            call(1, "get_view", json!({})),
+            call(1, "list_sessions", json!({})),
             call(
                 2,
                 "dispatch",
-                json!({"type": "select", "target": "files", "item": "b",
+                json!({"session": "left", "type": "select", "target": "files",
+                                       "item": "b", "expected_instance": 1, "expected_revision": 0}),
+            ),
+            call(3, "get_view", json!({"session": "right"})),
+            call(4, "get_view", json!({"session": "nope"})),
+            call(5, "get_view", json!({"pid": std::process::id()})),
+        ],
+    );
+    let sessions = tool_json(&r[0])["sessions"].clone();
+    let names: Vec<&str> = sessions
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["session"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["left", "right"]);
+    assert_eq!(sessions[0]["status"], "ready");
+    assert_eq!(sessions[0]["pid"], std::process::id());
+
+    let out = tool_json(&r[1]);
+    assert_eq!(
+        (out["session"].clone(), out["instance"].clone()),
+        (json!("left"), json!(1))
+    );
+    assert_eq!(left.lock().view()["widgets"]["files"]["selected"], "b");
+    // Only the named session changed.
+    assert_eq!(tool_json(&r[2])["widgets"]["files"]["selected"], "a");
+
+    assert_eq!(tool_json(&r[3])["error"], "unknown_session");
+    assert_eq!(tool_json(&r[3])["sessions"], json!(["left", "right"]));
+    assert_eq!(tool_json(&r[4])["status"], "ready");
+}
+
+#[test]
+fn stale_expectations_are_refused() {
+    let dir = Dir::new("stale");
+    let (_app, _running) = app(&dir, "s");
+    let server = Server::new(Bridge::new(&dir.0), "0");
+    let r = session(
+        &server,
+        &[
+            call(
+                1,
+                "dispatch",
+                json!({"session": "s", "type": "select", "target": "files", "item": "b",
+                                       "expected_instance": 1, "expected_revision": 0}),
+            ),
+            call(
+                2,
+                "dispatch",
+                json!({"session": "s", "type": "select", "target": "files", "item": "a",
                                        "expected_instance": 1, "expected_revision": 0}),
             ),
             call(
                 3,
                 "dispatch",
-                json!({"type": "select", "target": "files", "item": "a",
-                                       "expected_instance": 1, "expected_revision": 0}),
+                json!({"session": "s", "type": "select", "target": "files", "item": "a",
+                                       "expected_instance": 7}),
             ),
             call(
                 4,
-                "dispatch",
-                json!({"type": "select", "target": "files", "item": "a",
-                                       "expected_instance": 7}),
+                "get_view",
+                json!({"session": "s", "since": 0, "instance": 1}),
             ),
-            call(5, "get_view", json!({"since": 0, "instance": 1})),
-            call(6, "get_view", json!({"since": 0, "instance": 7})),
+            call(
+                5,
+                "get_view",
+                json!({"session": "s", "since": 0, "instance": 7}),
+            ),
+            call(6, "capture_view", json!({"session": "s"})),
         ],
     );
-    let view = tool_json(&r[0]);
-    assert_eq!(
-        (
-            view["status"].clone(),
-            view["instance"].clone(),
-            view["revision"].clone()
-        ),
-        (json!("ready"), json!(1), json!(0))
-    );
-
-    let out = tool_json(&r[1]);
-    assert_eq!(
-        (out["instance"].clone(), out["revision"].clone()),
-        (json!(1), json!(1))
-    );
-
-    assert_eq!(r[2]["result"]["isError"], true);
-    assert_eq!(tool_json(&r[2])["error"], "stale_revision");
-
-    assert_eq!(r[3]["result"]["isError"], true);
-    assert_eq!(tool_json(&r[3])["error"], "stale_instance");
-    assert_eq!(tool_json(&r[3])["current_instance"], 1);
-
-    assert_eq!(tool_json(&r[4])["changes"][0]["value"], "b");
+    assert_eq!(tool_json(&r[1])["error"], "stale_revision");
+    assert_eq!(tool_json(&r[2])["error"], "stale_instance");
+    assert_eq!(tool_json(&r[2])["current_instance"], 1);
+    assert_eq!(tool_json(&r[3])["changes"][0]["value"], "b");
     // `since` from another instance is meaningless: the whole view instead.
-    assert_eq!(tool_json(&r[5])["widgets"]["files"]["selected"], "b");
-}
-
-#[test]
-fn capture_view_is_the_applications_to_answer() {
-    let server = server("capture");
-    connect(&server, &app());
-    let r = session(&server, &[call(1, "capture_view", json!({}))]);
-    assert_eq!(r[0]["result"]["isError"], true);
-    assert_eq!(tool_json(&r[0])["error"], "not_supported");
+    assert_eq!(tool_json(&r[4])["widgets"]["files"]["selected"], "b");
+    assert_eq!(tool_json(&r[5])["error"], "not_supported");
 }

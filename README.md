@@ -10,34 +10,43 @@ guess keystrokes or coordinates. The UI is one serializable state. The terminal
 draws it for the person, and MCP serves the same state to the agent as
 structured data. Both change it through the same semantic actions.
 
-The agent reaches the application through a separate, long-lived
-`hbui-mcp-bridge` process. So you can rebuild and restart the application as
-often as you like, and it can even crash, without the agent losing its MCP
-connection:
+The agent reaches applications through `hbui-mcp-bridge`, a stdio MCP server
+that the agent's client starts. Each application claims a named **session**.
+The bridge finds every session by itself, so you can run several applications
+at once and rebuild or restart them as often as you like (they can even
+crash) without the agent losing its MCP connection:
 
 ```text
-agent ──MCP── hbui-mcp-bridge ──hbui-ipc── application ── UiState ── terminal ── person
-             (long-lived)                 (short-lived)
+agent ──MCP── hbui-mcp-bridge ──┬── session "commander" ── commander ── terminal ── person
+      (stdio)                   └── session "voxeler"   ── rs-voxeler
 ```
+
+Each application is identified three ways:
+
+- **session**: the logical application, stable across restarts. Agents name
+  it on every call.
+- **instance**: which run of that session. It goes up by one on each restart.
+- **pid**: the current process. It can be used as a selector.
 
 The first targets are a terminal UI and MCP. GUI renderers (egui / wgpu) come
 next, once the core has proven itself, with rs-voxeler as the eventual user.
-The design and its reasoning are in [docs/DESIGN.md](docs/DESIGN.md), and the
-bridge's in [docs/MCP_BRIDGE.md](docs/MCP_BRIDGE.md). Both are in Japanese.
+The design and its reasoning are in [docs/DESIGN.md](docs/DESIGN.md), the
+bridge's in [docs/MCP_BRIDGE.md](docs/MCP_BRIDGE.md), and sessions in
+[docs/SESSIONS.md](docs/SESSIONS.md). All three are in Japanese.
 
 ## Try it
 
-In one terminal, start the bridge and leave it running:
+Register the bridge once. The agent's client starts it:
 
 ```bash
-make bridge                         # MCP on http://127.0.0.1:8740/mcp
-claude mcp add --transport http hbui http://127.0.0.1:8740/mcp
+make build
+claude mcp add hbui -- $PWD/crates/target/debug/hbui-mcp-bridge
 ```
 
-In another terminal, start the application. Restart it whenever you like:
+Start an application in a terminal, and restart it whenever you like:
 
 ```bash
-make run DIR=~                      # the two-pane commander
+make run DIR=~                      # the two-pane commander, session "commander"
 ```
 
 Then use it from both sides at once. Press Tab, arrows and Enter in the
@@ -47,28 +56,44 @@ while the agent is deciding, its stale action is refused and it has to look
 again. If you quit and rerun the commander, the agent sees a new `instance` and
 carries on over the same connection.
 
-The bridge can also be a stdio server spawned by the agent's client, for
-example `claude mcp add hbui -- $PWD/crates/target/debug/hbui-mcp-bridge`.
-The application still runs on its own:
+More applications just take more sessions:
 
 ```bash
-./crates/target/debug/commander --headless ~   # no terminal; only the agent drives it
+./crates/target/debug/commander --hbui-session work ~/work   # named explicitly
+./crates/target/debug/commander --headless /tmp              # no terminal; only agents drive it
 ```
 
-The application and the bridge find each other through a Unix socket,
-`$HBUI_SOCKET` or `hbui-dev-$USER.sock` in the temp dir. Both take
-`--socket PATH`.
+Without `--hbui-session`, an application takes its own name, or `name-2`,
+`name-3`, and so on if that is taken. A name held by a running process can't
+be claimed twice.
+
+Sessions live in `$HBUI_DIR`, or `hbui-$USER` in the temp dir, as
+`<session>.sock` (0600) plus a `<session>.lock`. The lock is held while the
+process lives and also stores the instance counter. Several agents, each with
+its own bridge, can reach the same sessions at once.
 
 Commander keys: `Tab` switches pane, `Enter` opens, `F2` renames, `F5` copies,
 `F7` makes a directory, `^R` refreshes, `Esc` closes a dialog, `^Q` quits.
 
 ## What the agent sees
 
-`get_view` returns the semantic view:
+`list_sessions` shows what is running:
+
+```json
+{ "sessions": [
+  { "session": "commander", "application": "commander", "pid": 1234,
+    "cwd": "/Users/me", "instance": 7, "status": "ready", "revision": 12 },
+  { "session": "work", "application": "commander", "pid": 2345,
+    "cwd": "/Users/me/work", "instance": 1, "status": "disconnected", "revision": 4 }
+] }
+```
+
+`get_view {session: "commander"}` returns the semantic view:
 
 ```json
 {
   "status": "ready",
+  "session": "commander",
   "instance": 3,
   "revision": 42,
   "focus": "left.files",
@@ -89,9 +114,9 @@ Commander keys: `Tab` switches pane, `Enter` opens, `F2` renames, `F5` copies,
 `dispatch` runs one action and reports exactly what changed:
 
 ```json
-{ "type": "select", "target": "left.files", "item": "Downloads",
+{ "session": "commander", "type": "select", "target": "left.files", "item": "Downloads",
   "expected_instance": 3, "expected_revision": 42 }
-→ { "ok": true, "instance": 3, "revision": 43,
+→ { "ok": true, "session": "commander", "instance": 3, "revision": 43,
     "changes": [{ "op": "replace", "path": "/widgets/left.files/selected", "value": "Downloads" }] }
 ```
 
@@ -129,9 +154,9 @@ impl Controller for App {
 }
 
 let shared = Shared::new(Session::new(ui, App));
-// Reach the agent through the bridge. This retries in the background and
-// never blocks or fails the application.
-hbui_ipc::Endpoint::new(shared.clone(), hbui_ipc::default_socket(), "my-app").spawn();
+// Open a session for agents. Keep `_running` alive: dropping it closes the
+// session. Bridges find it by themselves.
+let _running = hbui_ipc::Endpoint::new(shared.clone(), "my-app").start()?;
 hbui_terminal::run(&shared)?;
 ```
 
@@ -141,8 +166,8 @@ hbui_terminal::run(&shared)?;
 | --- | --- |
 | `hbui-core` | `UiState`, widgets (text, list, tree, input, button), layout (split, tabs, pane, modal), semantic actions, keymap, revisions and diffs, the semantic view. No terminal types. |
 | `hbui-terminal` | Renders into a cell `Surface`, writes only the changed cells, normalizes crossterm input, and restores the terminal on drop and on panic. |
-| `hbui-ipc` | The application ↔ bridge link: a Unix socket carrying JSON lines, a versioned handshake, instance ids, and a pushed view cache. The app side is `Endpoint` and the bridge side is `Bridge`. |
-| `hbui-mcp-bridge` | The long-lived MCP server (stdio, or streamable HTTP on loopback). It forwards `get_view` / `dispatch` / `capture_view` and owns no UI state. |
+| `hbui-ipc` | Sessions and the application ↔ bridge link: one Unix socket per session carrying JSON lines, a versioned handshake, per-session instance counters, and pushed views. The app side is `Endpoint` and the bridge side is `Bridge`. |
+| `hbui-mcp-bridge` | The stdio MCP server. It finds sessions and forwards `get_view` / `dispatch` / `capture_view` to the session named. It owns no UI state. |
 | `commander` | A Norton Commander-style two-pane file browser, used as the proof of concept. |
 
 The link is a Unix socket, so macOS and Linux only for now.

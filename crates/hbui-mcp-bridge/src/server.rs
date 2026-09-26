@@ -1,14 +1,15 @@
-//! The MCP tools, forwarded to whichever application is connected.
+//! The MCP tools, forwarded to the session each call names.
 //!
-//! `get_view`, `dispatch` and `capture_view` are the application's; the bridge
-//! adds the `instance` they came from, refuses `stale_instance`, and answers
-//! for the application when it is not there. Answers, not fails: an
-//! application that is down is a state the agent reads in a normal result,
-//! never a transport error that looks like the bridge broke.
+//! `list_sessions` is the bridge's own. `get_view`, `dispatch` and
+//! `capture_view` are the application's: the bridge adds the `session` and
+//! `instance` they came from, refuses `stale_instance`, and answers for the
+//! application when it is not there. Answers, not fails: an application that
+//! is down is a state the agent reads in a normal result, never an error
+//! that looks like the bridge broke.
 
 use std::sync::Arc;
 
-use hbui_ipc::{Bridge, RequestError, VERSION};
+use hbui_ipc::{Bridge, RequestError, Target, VERSION};
 use serde_json::{json, Value};
 
 use crate::wire::{
@@ -19,13 +20,17 @@ use crate::wire::{
 pub const NAME: &str = "hbui-mcp-bridge";
 
 const INSTRUCTIONS: &str = "\
-This server is a bridge to a live user interface that a person may be using at the same \
-time as you. The application behind it may be restarted at any moment (it is being \
+This server bridges to live user interfaces — hbui applications — that a person may be \
+using at the same time as you. Applications may be restarted at any moment (they are being \
 developed); this connection stays up regardless.
 
-Read the UI with get_view: widgets by stable id, each with a role, its state and the \
-actions it accepts; the layout; the focused widget; the open modal; the commands. Every \
-view carries an `instance` (which run of the application) and a `revision` (which state of \
+Start with list_sessions: one row per application, named by `session`. Name the session \
+on every other call; there is no current session. `pid` works as a selector too, but \
+sessions survive restarts and pids do not.
+
+Read a UI with get_view: widgets by stable id, each with a role, its state and the actions \
+it accepts; the layout; the focused widget; the open modal; the commands. Every view \
+carries an `instance` (which run of the application) and a `revision` (which state of \
 that run). Never guess coordinates or keys.
 
 Change it with dispatch, one semantic action at a time, naming widgets and items by id. \
@@ -34,9 +39,9 @@ means the application restarted; stale_revision means the person changed somethi
 both cases read the view again. The result lists exactly what changed; an empty list means \
 the action had no visible effect.
 
-If get_view reports status application_unavailable or application_disconnected, the \
-application is not running — the bridge is fine. A last_view marked stale is the state \
-just before it went away, for diagnosis only; do not act on it.";
+If get_view reports status application_disconnected, that application is not running — \
+the bridge is fine. A last_view marked stale is its state just before it went away, for \
+diagnosis only; do not act on it.";
 
 pub struct Server {
     bridge: Arc<Bridge>,
@@ -95,10 +100,16 @@ impl Server {
     }
 
     pub fn call(&self, name: &str, args: &Value) -> CallResult {
+        // Look before answering, so an application started a moment ago is
+        // already in the list.
+        self.bridge.scan();
         match name {
-            "get_view" => self.get_view(args),
-            "dispatch" => self.dispatch(args),
-            "capture_view" => self.capture_view(args),
+            "list_sessions" => CallResult::json(&json!({
+                "sessions": self.bridge.list().iter().map(|s| s.to_json()).collect::<Vec<_>>(),
+            })),
+            "get_view" => self.with_session(args, |s| self.get_view(s, args)),
+            "dispatch" => self.with_session(args, |s| self.dispatch(s, args)),
+            "capture_view" => self.with_session(args, |s| self.capture_view(s, args)),
             other => CallResult::failure(&json!({
                 "ok": false,
                 "error": "unknown_tool",
@@ -107,124 +118,161 @@ impl Server {
         }
     }
 
-    fn get_view(&self, args: &Value) -> CallResult {
+    /// Resolve the `session` or `pid` a call names, or refuse it with the
+    /// sessions that do exist.
+    fn with_session(&self, args: &Value, f: impl FnOnce(&str) -> CallResult) -> CallResult {
+        let target = match (args.get("session").and_then(Value::as_str), args.get("pid")) {
+            (Some(s), _) => Target::Session(s.to_string()),
+            (None, Some(p)) => match p.as_u64().and_then(|p| u32::try_from(p).ok()) {
+                Some(p) => Target::Pid(p),
+                None => return self.no_session("session_required", "pid must be a number"),
+            },
+            (None, None) => {
+                return self.no_session(
+                    "session_required",
+                    "name the application with `session` (see list_sessions)",
+                )
+            }
+        };
+        match self.bridge.resolve(&target) {
+            Some(session) => f(&session),
+            None => self.no_session("unknown_session", &format!("no session matches {target:?}")),
+        }
+    }
+
+    fn no_session(&self, error: &str, message: &str) -> CallResult {
+        let names: Vec<String> = self.bridge.list().into_iter().map(|s| s.session).collect();
+        CallResult::failure(&json!({
+            "ok": false,
+            "error": error,
+            "message": message,
+            "sessions": names,
+        }))
+    }
+
+    fn get_view(&self, session: &str, args: &Value) -> CallResult {
         let since = args.get("since").and_then(Value::as_u64);
         let instance = args.get("instance").and_then(Value::as_u64);
         // A revision only means something within its instance: revision 3 of
         // the last run is not revision 3 of this one. So `since` is honoured
         // only when the caller says which instance it belongs to, and that
-        // instance is still the one connected.
+        // instance is still the one running.
         let attempt = match (since, instance) {
             (Some(since), Some(instance)) => {
-                match self
-                    .bridge
-                    .request(Some(instance), "get_view", json!({ "since": since }))
-                {
+                match self.bridge.request(
+                    session,
+                    Some(instance),
+                    "get_view",
+                    json!({ "since": since }),
+                ) {
                     Err(RequestError::StaleInstance { .. }) => None,
                     other => Some(other),
                 }
             }
             _ => None,
         };
-        let result = attempt.unwrap_or_else(|| self.bridge.request(None, "get_view", json!({})));
+        let result =
+            attempt.unwrap_or_else(|| self.bridge.request(session, None, "get_view", json!({})));
         match result {
-            Ok((instance, Ok(mut view))) => {
-                view["instance"] = json!(instance);
+            Ok((instance, Ok(view))) => {
+                let mut view = labelled(view, session, instance);
                 view["status"] = json!("ready");
                 CallResult::json(&view)
             }
-            Ok((instance, Err(e))) => CallResult::failure(&with_instance(e, instance)),
-            Err(e) => CallResult::json(&self.unavailable(&e)),
+            Ok((instance, Err(e))) => CallResult::failure(&labelled(e, session, instance)),
+            Err(e) => match self.unreachable(session, &e) {
+                // An absent application is a state to report, not a failure.
+                v if v["status"].is_string() => CallResult::json(&v),
+                v => CallResult::failure(&v),
+            },
         }
     }
 
-    fn dispatch(&self, args: &Value) -> CallResult {
+    fn dispatch(&self, session: &str, args: &Value) -> CallResult {
         let mut action = args.clone();
-        let expected = action
-            .as_object_mut()
-            .and_then(|o| o.remove("expected_instance"))
-            .and_then(|v| v.as_u64());
-        match self.bridge.request(expected, "dispatch", action) {
-            Ok((instance, Ok(outcome))) => CallResult::json(&with_instance(outcome, instance)),
-            Ok((instance, Err(e))) => CallResult::failure(&with_instance(e, instance)),
-            Err(e) => CallResult::failure(&self.refusal(&e)),
+        let expected = action.as_object_mut().and_then(|o| {
+            o.remove("session");
+            o.remove("pid");
+            o.remove("expected_instance")
+        });
+        let expected = expected.and_then(|v| v.as_u64());
+        match self.bridge.request(session, expected, "dispatch", action) {
+            Ok((instance, Ok(outcome))) => CallResult::json(&labelled(outcome, session, instance)),
+            Ok((instance, Err(e))) => CallResult::failure(&labelled(e, session, instance)),
+            Err(e) => CallResult::failure(&refusal(self.unreachable(session, &e))),
         }
     }
 
-    fn capture_view(&self, args: &Value) -> CallResult {
-        match self.bridge.request(None, "capture_view", args.clone()) {
+    fn capture_view(&self, session: &str, args: &Value) -> CallResult {
+        let size = json!({ "width": args.get("width"), "height": args.get("height") });
+        match self.bridge.request(session, None, "capture_view", size) {
             Ok((instance, Ok(v))) => CallResult::text(format!(
-                "instance {instance} revision {}\n{}",
+                "session {session} instance {instance} revision {}\n{}",
                 v["revision"],
                 v["text"].as_str().unwrap_or("")
             )),
-            Ok((instance, Err(e))) => CallResult::failure(&with_instance(e, instance)),
-            Err(e) => CallResult::failure(&self.refusal(&e)),
+            Ok((instance, Err(e))) => CallResult::failure(&labelled(e, session, instance)),
+            Err(e) => CallResult::failure(&refusal(self.unreachable(session, &e))),
         }
     }
 
-    /// What `get_view` says when it cannot reach the application.
-    fn unavailable(&self, e: &RequestError) -> Value {
-        let status = self.bridge.status();
-        if let Some(m) = status.mismatch {
-            return json!({
-                "status": "protocol_mismatch",
-                "bridge_version": VERSION,
-                "application_version": m.application_version,
-                "message": "the application speaks another hbui-ipc version; rebuild it or restart the bridge",
-            });
-        }
-        match status.snapshot {
-            // It was here. Show what it last looked like — flagged, so it is
-            // never taken for the present.
-            Some(snap) => {
-                let mut last = snap.view;
-                last["instance"] = json!(snap.instance);
-                json!({
-                    "status": "application_disconnected",
-                    "application": { "connected": false, "name": snap.application },
-                    "stale": true,
-                    "last_view": last,
-                    "message": match e {
-                        RequestError::Timeout => "the application stopped answering",
-                        _ => "the application is not running; last_view is its state before it went away",
-                    },
-                })
-            }
-            None => json!({
-                "status": "application_unavailable",
-                "application": { "connected": false },
-                "message": "no application has connected to the bridge yet",
-            }),
-        }
-    }
-
-    /// The refusal for an action or capture that could not reach the
-    /// application.
-    fn refusal(&self, e: &RequestError) -> Value {
+    /// Describe why `session` could not be asked. States — the application
+    /// is down, or speaks another version — carry a `status`; failures of
+    /// the call itself carry an `error`.
+    fn unreachable(&self, session: &str, e: &RequestError) -> Value {
         match e {
+            RequestError::Unavailable { snapshot } => {
+                let mut v = json!({
+                    "status": "application_disconnected",
+                    "session": session,
+                    "application": { "connected": false },
+                });
+                match snapshot {
+                    // It was here. Show what it last looked like — flagged,
+                    // so it is never taken for the present.
+                    Some((instance, view)) => {
+                        v["stale"] = json!(true);
+                        v["last_view"] = labelled(view.clone(), session, *instance);
+                        v["message"] = json!(
+                            "the application is not running; last_view is its state before it went away"
+                        );
+                    }
+                    None => v["message"] = json!("the application is not running"),
+                }
+                v
+            }
+            RequestError::Mismatch {
+                application_version,
+            } => json!({
+                "status": "protocol_mismatch",
+                "session": session,
+                "bridge_version": VERSION,
+                "application_version": application_version,
+                "message": "the application speaks another hbui-ipc version; rebuild it or restart the bridge",
+            }),
+            RequestError::UnknownSession => json!({
+                "ok": false,
+                "error": "unknown_session",
+                "message": format!("no session {session:?}"),
+            }),
             RequestError::StaleInstance { current } => json!({
                 "ok": false,
                 "error": "stale_instance",
+                "session": session,
                 "current_instance": current,
                 "message": format!("the application restarted (now instance {current}); read the view again before acting"),
             }),
-            RequestError::Unavailable => {
-                let mut v = self.unavailable(e);
-                v.as_object_mut().map(|o| o.remove("last_view"));
-                v["ok"] = json!(false);
-                v["error"] = v["status"].clone();
-                v
-            }
             RequestError::Disconnected => json!({
                 "ok": false,
                 "error": "application_disconnected",
+                "session": session,
                 "outcome": "unknown",
                 "message": "the application went away while handling this; it may or may not have been applied",
             }),
             RequestError::Timeout => json!({
                 "ok": false,
                 "error": "application_timeout",
+                "session": session,
                 "outcome": "unknown",
                 "message": "the application did not answer in time; it may or may not have been applied",
             }),
@@ -232,38 +280,79 @@ impl Server {
     }
 }
 
-fn with_instance(mut v: Value, instance: u64) -> Value {
+/// An unreachable state turned into a refusal, for calls that needed the
+/// application to act: the state's name becomes the error, and a stale view
+/// is left out — it cannot help an action that was not taken.
+fn refusal(mut v: Value) -> Value {
+    if let Some(status) = v.get("status").cloned() {
+        if let Some(o) = v.as_object_mut() {
+            o.remove("status");
+            o.remove("last_view");
+            o.remove("stale");
+        }
+        v["ok"] = json!(false);
+        v["error"] = status;
+    }
+    v
+}
+
+fn labelled(mut v: Value, session: &str, instance: u64) -> Value {
     if v.is_object() {
+        v["session"] = json!(session);
         v["instance"] = json!(instance);
     }
     v
 }
 
+fn target_props() -> Value {
+    json!({
+        "session": { "type": "string", "description": "The session to act on (see list_sessions)." },
+        "pid": { "type": "integer", "description": "Alternatively, the application's process id." },
+    })
+}
+
+fn with_target(mut schema: Value) -> Value {
+    let props = schema["properties"]
+        .as_object_mut()
+        .expect("an object schema");
+    for (k, v) in target_props().as_object().unwrap() {
+        props.insert(k.clone(), v.clone());
+    }
+    schema
+}
+
 fn tools() -> Vec<ToolInfo> {
     vec![
         ToolInfo {
+            name: "list_sessions",
+            description: "List the hbui applications this bridge can reach: session, application, \
+                          pid, cwd, instance, status (ready / disconnected / protocol_mismatch) \
+                          and the last revision seen.",
+            input_schema: json!({ "type": "object", "properties": {} }),
+        },
+        ToolInfo {
             name: "get_view",
-            description: "Read the UI as structured data: widgets by id (role, state, accepted actions), \
-                          layout, focus, open modal, commands, plus `instance` and `revision`. With \
-                          `since` and `instance`, return only the changes after that revision. If the \
-                          application is not running, `status` says so.",
-            input_schema: json!({
+            description: "Read a session's UI as structured data: widgets by id (role, state, \
+                          accepted actions), layout, focus, open modal, commands, plus `instance` \
+                          and `revision`. With `since` and `instance`, return only the changes after \
+                          that revision. If the application is not running, `status` says so.",
+            input_schema: with_target(json!({
                 "type": "object",
                 "properties": {
                     "since": { "type": "integer", "description": "A revision you read before." },
                     "instance": { "type": "integer", "description": "The instance that revision belongs to." },
                 },
-            }),
+            })),
         },
         ToolInfo {
             name: "dispatch",
-            description: "Run one semantic action. Returns the instance, the new revision and the list \
-                          of changes. Refused with stale_instance / stale_revision if the expectations \
-                          are not current.\n\
+            description: "Run one semantic action in a session. Returns the instance, the new \
+                          revision and the list of changes. Refused with stale_instance / \
+                          stale_revision if the expectations are not current.\n\
                           focus{target} · select{target,item} · activate{target,item?} · \
                           set_text{target,value} · expand{target,item} · collapse{target,item} · \
                           invoke{command} · close_modal{}",
-            input_schema: json!({
+            input_schema: with_target(json!({
                 "type": "object",
                 "properties": {
                     "type": {
@@ -278,19 +367,19 @@ fn tools() -> Vec<ToolInfo> {
                     "expected_revision": { "type": "integer", "description": "The revision you last read." },
                 },
                 "required": ["type"],
-            }),
+            })),
         },
         ToolInfo {
             name: "capture_view",
-            description: "Render the UI as the person's screen would draw it, as text. For checking what \
-                          is drawn; work from get_view, not from this.",
-            input_schema: json!({
+            description: "Render a session's UI as the person's screen would draw it, as text. \
+                          For checking what is drawn; work from get_view, not from this.",
+            input_schema: with_target(json!({
                 "type": "object",
                 "properties": {
                     "width": { "type": "integer", "default": 80 },
                     "height": { "type": "integer", "default": 24 },
                 },
-            }),
+            })),
         },
     ]
 }
