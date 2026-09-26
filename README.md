@@ -123,7 +123,10 @@ Commander keys: `Tab` switches pane, `Enter` opens, `F2` renames, `F5` copies,
 If `changes` is empty, the action had no visible effect. The action is
 refused with `stale_revision` if the person changed something in between, and
 with `stale_instance` if the application restarted. `get_view {since: 42,
-instance: 3}` returns only the changes since revision 42.
+instance: 3}` returns only the changes since revision 42. For the last 64
+revisions that is an exact diff. Further back (up to 4,096 revisions) it is
+marked `"merged": true`: every path that changed, with its current value, as
+`replace` or `remove` ops only.
 
 While the application is down, `get_view` still answers, with `status:
 "application_disconnected"` and the last view it saw, marked `"stale": true`.

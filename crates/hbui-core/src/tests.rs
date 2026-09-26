@@ -319,3 +319,35 @@ fn errors_name_the_problem() {
         .unwrap_err();
     assert_eq!(err.to_json()["message"], "that went wrong");
 }
+
+/// Past the kept views, `since` still answers with what changed — merged,
+/// and exact as to state.
+#[test]
+fn get_view_since_merges_beyond_the_kept_views() {
+    let mut s = session();
+    // An early change that nothing later touches again ...
+    s.dispatch(
+        Action::Focus {
+            target: "right.files".into(),
+        }
+        .into(),
+    )
+    .unwrap();
+    // ... then enough traffic to push revision 0's view out of history.
+    for i in 0..100 {
+        s.update(|ui| ui.set_text("status", format!("tick {i}")));
+    }
+    let v = s.view_since(0);
+    assert_eq!(v["merged"], true);
+    assert_eq!(v["since"], 0);
+    let changes = v["changes"].as_array().unwrap();
+    let paths: Vec<&str> = changes
+        .iter()
+        .map(|c| c["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["/focus", "/widgets/status/value"]);
+    assert_eq!(changes[0]["value"], "right.files");
+    assert_eq!(changes[1]["value"], "tick 99");
+    // A revision that never existed still gets the whole view.
+    assert_eq!(s.view_since(10_000)["full"], true);
+}

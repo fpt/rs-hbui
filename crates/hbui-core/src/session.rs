@@ -14,7 +14,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::action::{self, Action, ActionError, ActionRequest, Event};
-use crate::diff::{diff, Change};
+use crate::diff::{diff, merge, Change};
 use crate::input::{InputEvent, Key};
 use crate::keymap::{self, Human};
 use crate::state::UiState;
@@ -24,6 +24,12 @@ use crate::widget::Widget;
 /// How many past views are kept for `get_view(since)`. Older than this, the
 /// caller gets the whole view again — correct, just larger.
 const HISTORY: usize = 64;
+
+/// How many revisions' touched paths are kept, for merged diffs further back
+/// than [`HISTORY`]. A revision's paths are a few short strings — a person
+/// arrowing through a long list makes one per keystroke — so this can be
+/// generous.
+const LOG: usize = 4096;
 
 /// The application: whatever gives activation and commands their meaning.
 ///
@@ -56,6 +62,8 @@ pub struct Session {
     controller: Box<dyn Controller>,
     /// `(revision, view body)`, oldest first. Never empty.
     history: VecDeque<(u64, Value)>,
+    /// `(revision, paths that revision changed)`, oldest first.
+    log: VecDeque<(u64, Vec<String>)>,
 }
 
 impl Session {
@@ -67,6 +75,7 @@ impl Session {
             ui,
             controller: Box::new(controller),
             history: VecDeque::from([(0, body)]),
+            log: VecDeque::new(),
         }
     }
 
@@ -86,21 +95,39 @@ impl Session {
         v
     }
 
-    /// What changed since `since`. The whole view instead, marked `"full":
-    /// true`, if `since` is too old to diff against or was never a revision.
+    /// What changed since `since`.
+    ///
+    /// Within the last [`HISTORY`] revisions, an exact diff. Further back,
+    /// within [`LOG`], a merged diff marked `"merged": true` (see
+    /// [`crate::diff::merge`]). Further still, or for a revision that never
+    /// existed, the whole view instead, marked `"full": true`.
     pub fn view_since(&self, since: u64) -> Value {
         let current = self.revision();
-        match self.history.iter().find(|(r, _)| *r == since) {
-            Some((_, old)) => {
-                let (_, now) = self.history.back().expect("history is never empty");
-                json!({ "revision": current, "since": since, "changes": diff(old, now) })
-            }
-            None => {
-                let mut v = self.view();
-                v["full"] = json!(true);
-                v
-            }
+        let (_, now) = self.history.back().expect("history is never empty");
+        if let Some((_, old)) = self.history.iter().find(|(r, _)| *r == since) {
+            return json!({ "revision": current, "since": since, "changes": diff(old, now) });
         }
+        let logged = self
+            .log
+            .front()
+            .is_some_and(|(first, _)| *first <= since + 1)
+            && since < current;
+        if logged {
+            let touched = self
+                .log
+                .iter()
+                .filter(|(r, _)| *r > since)
+                .flat_map(|(_, paths)| paths.iter().map(String::as_str));
+            return json!({
+                "revision": current,
+                "since": since,
+                "merged": true,
+                "changes": merge(touched, now),
+            });
+        }
+        let mut v = self.view();
+        v["full"] = json!(true);
+        v
     }
 
     /// Run an agent's action.
@@ -204,6 +231,11 @@ impl Session {
         let mut revision = *last_rev;
         if !changes.is_empty() {
             revision += 1;
+            self.log
+                .push_back((revision, changes.iter().map(|c| c.path.clone()).collect()));
+            if self.log.len() > LOG {
+                self.log.pop_front();
+            }
             self.history.push_back((revision, body));
             if self.history.len() > HISTORY {
                 self.history.pop_front();
