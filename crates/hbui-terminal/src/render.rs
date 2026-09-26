@@ -7,7 +7,8 @@
 //! coordinates.
 
 use hbui_core::text::width;
-use hbui_core::{Direction, Layout, Size, UiState, Widget, WidgetId};
+use hbui_core::widget::hotkey_index;
+use hbui_core::{hotkey, Direction, Layout, MenuItem, Size, UiState, Widget, WidgetId};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::surface::{Color, Rect, Style, Surface};
@@ -36,6 +37,11 @@ pub fn render(ui: &UiState, width: u16, height: u16) -> Frame {
         cursor: None,
     };
     let mut area = r.surface.area();
+    let menu_bar = !ui.menus.is_empty() && area.h > 2;
+    if menu_bar {
+        area.y += 1;
+        area.h -= 1;
+    }
     let bar = ui.commands.iter().any(|c| c.key.is_some()) && area.h > 1;
     if bar {
         area.h -= 1;
@@ -46,6 +52,13 @@ pub fn render(ui: &UiState, width: u16, height: u16) -> Frame {
         // Anything the screen behind put a cursor on is no longer where input goes.
         r.cursor = None;
         r.modal(area);
+    }
+    if menu_bar {
+        // Last, so a pulled-down menu lies over everything.
+        r.menu_bar(width);
+        if ui.open_menu().is_some() {
+            r.cursor = None;
+        }
     }
     // Belt and braces: whatever placed it, the cursor never sits in the last column.
     let cursor = r.cursor.map(|(x, y)| (x.min(width.saturating_sub(2)), y));
@@ -194,10 +207,66 @@ impl Renderer<'_> {
                 } else {
                     Style::PLAIN
                 };
-                self.surface
-                    .put_str(r.x, r.y, &format!("[ {} ]", b.label), style, r.right());
+                let (open, close) = if b.default {
+                    ("[< ", " >]")
+                } else {
+                    ("[ ", " ]")
+                };
+                let x = self.surface.put_str(r.x, r.y, open, style, r.right());
+                let x = self.label(x, r.y, &b.label, style, r.right());
+                self.surface.put_str(x, r.y, close, style, r.right());
+            }
+            Widget::Checkbox(c) => {
+                let style = if focused {
+                    Style::PLAIN.reverse()
+                } else {
+                    Style::PLAIN
+                };
+                let mark = if c.checked { "[x] " } else { "[ ] " };
+                let x = self.surface.put_str(r.x, r.y, mark, style, r.right());
+                self.label(x, r.y, &c.label, style, r.right());
+            }
+            Widget::Radio(g) => {
+                let mut y = r.y;
+                if !g.label.is_empty() {
+                    self.surface
+                        .put_str(r.x, y, &format!("{}:", g.label), Style::PLAIN, r.right());
+                    y += 1;
+                }
+                for item in &g.items {
+                    if y >= r.bottom() {
+                        break;
+                    }
+                    let chosen = g.selected.as_deref() == Some(item.id.as_str());
+                    let style = if chosen && focused {
+                        Style::PLAIN.reverse()
+                    } else {
+                        Style::PLAIN
+                    };
+                    let mark = if chosen { "(*) " } else { "( ) " };
+                    let x = self.surface.put_str(r.x, y, mark, style, r.right());
+                    self.surface.put_str(x, y, &item.label, style, r.right());
+                    y += 1;
+                }
             }
         }
+    }
+
+    /// Draw a label with its `&` hotkey marked, returning the column after it.
+    /// A dimmed (disabled) label's hotkey is not marked: it does nothing.
+    fn label(&mut self, x: u16, y: u16, label: &str, style: Style, max_x: u16) -> u16 {
+        let (shown, _) = hotkey(label);
+        let end = self.surface.put_str(x, y, &shown, style, max_x);
+        let hotkey_at = hotkey_index(label).filter(|_| style.fg != Color::Grey);
+        if let Some(i) = hotkey_at {
+            let before: String = shown.chars().take(i).collect();
+            let at = x + width(&before) as u16;
+            if at < end {
+                self.surface
+                    .restyle(Rect::new(at, y, 1, 1), style.fg(Color::Yellow).underline());
+            }
+        }
+        end
     }
 
     /// List-like rows with a `> ` marker on the selection, scrolled so the
@@ -238,7 +307,15 @@ impl Renderer<'_> {
     /// A one-line field, scrolled horizontally so the cursor stays at least
     /// [`SAFETY_MARGIN`] cells from the right edge.
     fn input(&mut self, input: &hbui_core::Input, r: Rect, focused: bool) {
-        let field = Rect::new(r.x, r.y, r.w, 1);
+        // A labelled field reads `Name: [text ]`; the label is not editable.
+        let x = if input.label.is_empty() {
+            r.x
+        } else {
+            let label = format!("{}: ", input.label);
+            self.surface
+                .put_str(r.x, r.y, &label, Style::PLAIN, r.right())
+        };
+        let field = Rect::new(x, r.y, r.right().saturating_sub(x), 1);
         let style = Style::PLAIN.underline();
         self.surface.fill(field, " ", style);
 
@@ -282,6 +359,7 @@ impl Renderer<'_> {
             match self.ui.widget(row[0].as_str()) {
                 Some(Widget::Text(t)) => t.value.lines().count().max(1) as u16,
                 Some(Widget::List(_) | Widget::Tree(_)) => 6,
+                Some(Widget::Radio(g)) => g.items.len() as u16 + u16::from(!g.label.is_empty()),
                 _ => 1,
             }
         };
@@ -309,7 +387,9 @@ impl Renderer<'_> {
             let mut x = body.x;
             for id in row {
                 let label = match self.ui.widget(id.as_str()) {
-                    Some(Widget::Button(b)) => width(&b.label) as u16 + 4,
+                    Some(Widget::Button(b)) => {
+                        width(&hotkey(&b.label).0) as u16 + if b.default { 6 } else { 4 }
+                    }
                     _ => body.right() - x,
                 };
                 self.widget(id, Rect::new(x, y, label.min(body.right() - x), rh));
@@ -324,21 +404,110 @@ impl Renderer<'_> {
 
     /// The command bar: `F2 Rename  F5 Copy`, drawn from the same command list
     /// the agent reads.
+    /// Disabled commands are drawn dimmed, and are never reversed like live
+    /// ones, so they do not look pressable.
     fn key_bar(&mut self, r: Rect) {
         let mut x = r.x;
         for c in &self.ui.commands {
             let Some(key) = c.key else { continue };
+            let (key_style, label_style) = if c.enabled {
+                (Style::PLAIN.bold(), Style::PLAIN.reverse())
+            } else {
+                (Style::PLAIN.fg(Color::Grey), Style::PLAIN.fg(Color::Grey))
+            };
             x = self
                 .surface
-                .put_str(x, r.y, &key.to_string(), Style::PLAIN.bold(), r.right());
+                .put_str(x, r.y, &key.to_string(), key_style, r.right());
             x = self.surface.put_str(
                 x,
                 r.y,
-                &format!(" {} ", c.label),
-                Style::PLAIN.reverse(),
+                &format!(" {} ", hotkey(&c.label).0),
+                label_style,
                 r.right(),
             );
             x = self.surface.put_str(x, r.y, " ", Style::PLAIN, r.right());
+        }
+    }
+
+    /// The menu bar along the top, and the pulled-down menu if there is one:
+    /// `  File  Command  Options `, as Midnight Commander draws it.
+    fn menu_bar(&mut self, cols: u16) {
+        let bar = Style::PLAIN.fg(Color::Black).reverse();
+        self.surface.fill(Rect::new(0, 0, cols, 1), " ", bar);
+        let open = self.ui.open_menu();
+        let mut x = 1;
+        let mut dropped = None;
+        for m in &self.ui.menus {
+            let is_open = open.is_some_and(|o| o.menu == m.id);
+            let style = if is_open { Style::PLAIN } else { bar };
+            let start = x;
+            x = self.surface.put_str(x, 0, " ", style, cols);
+            x = self.label(x, 0, &m.label, style, cols);
+            x = self.surface.put_str(x, 0, " ", style, cols);
+            if is_open {
+                dropped = Some((m, start));
+            }
+            x += 1;
+        }
+        let Some((menu, at)) = dropped else { return };
+        let highlighted = open.and_then(|o| o.highlighted.as_deref());
+
+        // Each row: ` Label      F5 `. Width fits the longest.
+        let rows: Vec<Option<(&hbui_core::Command, String)>> = menu
+            .items
+            .iter()
+            .map(|i| match i {
+                MenuItem::Command(id) => self
+                    .ui
+                    .command(id)
+                    .map(|c| (c, c.key.map(|k| k.to_string()).unwrap_or_default())),
+                MenuItem::Separator => None,
+            })
+            .collect();
+        let inner = rows
+            .iter()
+            .flatten()
+            .map(|(c, k)| width(&hotkey(&c.label).0) + if k.is_empty() { 0 } else { width(k) + 3 })
+            .max()
+            .unwrap_or(8) as u16
+            + 2;
+        let w = (inner + 2).min(cols);
+        let h = (rows.len() as u16 + 2).min(self.surface.height.saturating_sub(1));
+        let x0 = at.min(cols.saturating_sub(w));
+        let boxed = Rect::new(x0, 1, w, h);
+        self.surface.fill(boxed, " ", Style::PLAIN);
+        self.frame(boxed, "", Style::PLAIN);
+        for (i, row) in rows.iter().enumerate() {
+            let y = 2 + i as u16;
+            if y + 1 >= boxed.bottom() {
+                break;
+            }
+            let right = boxed.right() - 1;
+            match row {
+                None => {
+                    self.surface.put_str(x0, y, "├", Style::PLAIN, x0 + 1);
+                    for sx in x0 + 1..right {
+                        self.surface.put_str(sx, y, "─", Style::PLAIN, sx + 1);
+                    }
+                    self.surface.put_str(right, y, "┤", Style::PLAIN, right + 1);
+                }
+                Some((c, key)) => {
+                    let style = if !c.enabled {
+                        Style::PLAIN.fg(Color::Grey)
+                    } else if highlighted == Some(c.id.as_str()) {
+                        Style::PLAIN.reverse()
+                    } else {
+                        Style::PLAIN
+                    };
+                    self.surface
+                        .fill(Rect::new(x0 + 1, y, w.saturating_sub(2), 1), " ", style);
+                    self.label(x0 + 2, y, &c.label, style, right);
+                    if !key.is_empty() {
+                        let kx = right.saturating_sub(1 + width(key) as u16);
+                        self.surface.put_str(kx, y, key, style, right);
+                    }
+                }
+            }
         }
     }
 }

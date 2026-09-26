@@ -30,9 +30,11 @@ pub use diff::{Change, Op};
 pub use input::{InputEvent, Key};
 pub use layout::{Direction, Layout, Size, Tab};
 pub use session::{Controller, NoController, Outcome, Session, Shared};
-pub use state::{Command, Modal, UiState};
+pub use state::{Command, Menu, MenuItem, Modal, OpenMenu, UiState};
 pub use text::{TextBuffer, TextCursor};
-pub use widget::{Button, Input, Item, List, Text, Tree, TreeNode, Widget, WidgetId};
+pub use widget::{
+    hotkey, Button, Checkbox, Input, Item, List, RadioGroup, Text, Tree, TreeNode, Widget, WidgetId,
+};
 
 #[cfg(test)]
 mod tests;

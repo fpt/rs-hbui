@@ -351,18 +351,20 @@ fn tools() -> Vec<ToolInfo> {
                           revision and the list of changes. Refused with stale_instance / \
                           stale_revision if the expectations are not current.\n\
                           focus{target} · select{target,item} · activate{target,item?} · \
-                          set_text{target,value} · expand{target,item} · collapse{target,item} · \
+                          set_text{target,value} · set_checked{target,checked} · expand{target,item} · \
+                          collapse{target,item} · \
                           invoke{command} · close_modal{}",
             input_schema: with_target(json!({
                 "type": "object",
                 "properties": {
                     "type": {
                         "type": "string",
-                        "enum": ["focus", "select", "activate", "set_text", "expand", "collapse", "invoke", "close_modal"],
+                        "enum": ["focus", "select", "activate", "set_text", "set_checked", "expand", "collapse", "invoke", "close_modal"],
                     },
                     "target": { "type": "string", "description": "Widget id (or tab-set id for select)." },
                     "item": { "type": "string", "description": "Item id within the target." },
                     "value": { "type": "string", "description": "The full new text, for set_text." },
+                    "checked": { "type": "boolean", "description": "On or off, for set_checked." },
                     "command": { "type": "string", "description": "Command id, for invoke." },
                     "expected_instance": { "type": "integer", "description": "The instance you last read." },
                     "expected_revision": { "type": "integer", "description": "The revision you last read." },

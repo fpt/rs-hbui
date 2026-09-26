@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use crate::action::{self, Action, ActionError, ActionRequest, Event};
 use crate::diff::{diff, merge, Change};
 use crate::input::{InputEvent, Key};
-use crate::keymap::{self, Human};
+use crate::keymap::{self, Human, MenuNav};
 use crate::state::UiState;
 use crate::view::view_body;
 use crate::widget::Widget;
@@ -38,6 +38,11 @@ const LOG: usize = 4096;
 /// asked, and any change it made before refusing still stands.
 pub trait Controller: Send {
     fn handle(&mut self, ui: &mut UiState, event: &Event) -> Result<(), String>;
+
+    /// Called before every commit, whoever changed what: the place to keep
+    /// derived state in step — which commands are enabled for the current
+    /// selection, say — since most changes never reach [`Self::handle`].
+    fn settle(&mut self, _ui: &mut UiState) {}
 }
 
 /// A controller that handles nothing, for UIs that are only widgets.
@@ -68,12 +73,15 @@ pub struct Session {
 
 impl Session {
     pub fn new(mut ui: UiState, controller: impl Controller + 'static) -> Self {
+        let mut controller: Box<dyn Controller> = Box::new(controller);
+        // Revision 0 is a settled state too.
+        controller.settle(&mut ui);
         ui.ensure_focus();
         ui.set_revision(0);
         let body = view_body(&ui);
         Self {
             ui,
-            controller: Box::new(controller),
+            controller,
             history: VecDeque::from([(0, body)]),
             log: VecDeque::new(),
         }
@@ -203,6 +211,17 @@ impl Session {
                 }
                 Ok(())
             }
+            Human::Menu(nav) => {
+                match nav {
+                    MenuNav::PullDown(id) => {
+                        self.ui.pull_down(&id);
+                    }
+                    MenuNav::Close => self.ui.close_menu(),
+                    MenuNav::Switch(delta) => self.ui.switch_menu(delta),
+                    MenuNav::Move(delta) => self.ui.move_highlight(delta),
+                }
+                Ok(())
+            }
             Human::Ignored => Ok(()),
         }
     }
@@ -224,6 +243,7 @@ impl Session {
     /// Settle focus, rebuild the view, and advance the revision if and only
     /// if the view changed.
     fn commit(&mut self) -> Outcome {
+        self.controller.settle(&mut self.ui);
         self.ui.ensure_focus();
         let body = view_body(&self.ui);
         let (last_rev, last) = self.history.back().expect("history is never empty");

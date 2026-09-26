@@ -59,9 +59,26 @@ committing.
   Every mutation path (`dispatch`, `input`, `update`) must end in `commit`.
 - **`expected_revision` is checked before anything runs.** A stale request has
   no effect at all.
-- **Priority is modal, then focused widget, then screen.** While a modal is
-  open, only its widgets are reachable: actions elsewhere return
-  `blocked_by_modal`, and so do commands.
+- **Priority is open menu, then modal, then focused widget, then screen.**
+  While a modal is open, only its widgets are reachable: actions elsewhere
+  return `blocked_by_modal`, and so do commands. A pulled-down menu takes
+  every key a person presses, but it never blocks an agent. `invoke` works
+  whether or not a menu is open, and closes it.
+- **Menus hold command ids, not actions.** Choosing a menu item is `invoke`.
+  Which menu is open, and what is highlighted, is `UiState` (`open_menu`), so
+  it appears in the view and the renderer draws it from there.
+- **Key conventions follow Midnight Commander** (`keymap.rs`):
+  - F9 opens the menu bar.
+  - In a dialog, Enter presses the default button, unless a button has focus.
+  - An arrow the focused widget has no use for moves focus.
+  - A `&` hotkey presses a button or toggles a checkbox, except while a text
+    field has focus.
+- **Derived state belongs in `Controller::settle`**, for example which
+  commands are enabled. It runs before every commit, including the first
+  view, because most changes (selection, typing) never reach `handle`.
+- **Labels carry `&` hotkeys.** The view strips the `&` and reports
+  `hotkey`, and the renderer marks the letter. Use `widget::hotkey`, and never
+  show a raw `&` to anyone.
 - **One view builder.** `view::view_body` produces the agent's view, the
   semantic snapshot and the diff input. Do not build a second one.
 - **Diff paths address id-keyed arrays by id**
@@ -140,6 +157,9 @@ committing.
 ## Not yet done
 
 Tabs have no key binding for a person yet (the agent can `select` them).
+Radio groups have no separate cursor: arrows change the choice directly, not
+the way mc's cursor-then-Space works. There is also no combo box
+(single-choice drop-down) and no input history.
 Other gaps: modal lists and trees, Table/Viewer/Graphics widgets, a GUI
 renderer, and `capture_view` returning an image for graphics panes. There is
 no Windows support yet (the IPC link is a Unix socket) and no `hbui-dev`

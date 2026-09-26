@@ -73,7 +73,29 @@ process lives and also stores the instance counter. Several agents, each with
 its own bridge, can reach the same sessions at once.
 
 Commander keys: `Tab` switches pane, `Enter` opens, `F2` renames, `F5` copies,
-`F7` makes a directory, `^R` refreshes, `Esc` closes a dialog, `^Q` quits.
+`F7` makes a directory, `^R` refreshes, `F9` opens the menu bar (File,
+Options → Panel options), `Esc` closes a dialog or menu, and `^Q` quits.
+
+## Widgets and conventions
+
+The widgets are text, list, tree, input, button, checkbox and radio group,
+laid out in splits, tabs and panes, with one modal dialog on top. A menu bar
+of pull-down menus sits along the top. The keyboard conventions come from
+[Midnight Commander](https://github.com/MidnightCommander/mc):
+
+- **Menu bar:** `F9` pulls the menus down. `←`/`→` switch menus, `↑`/`↓` move
+  the highlight, `Enter` chooses, `Esc` closes, and a letter picks an item or
+  menu by its hotkey. Menu items are commands, so an agent just `invoke`s
+  them and never opens a menu.
+- **Dialogs:** `Enter` presses the default button (`[< OK >]`) from anywhere
+  in the dialog, and `Esc` cancels. `Tab`, or an arrow the focused widget has
+  no use for, moves between widgets. A button's or checkbox's hotkey letter
+  presses it, except while typing in a text field.
+- **Hotkeys:** a label marks its hotkey with `&`, as in `&Copy`. The view
+  reports the label without the `&` and adds `"hotkey": "c"`.
+- **Disabled commands:** they are drawn dimmed, skipped in menus, and refused
+  with `command_disabled`. An application keeps them current in
+  `Controller::settle`, which runs after every change.
 
 ## What the agent sees
 
@@ -135,8 +157,8 @@ diagnosis. `capture_view` returns the
 terminal's drawing as text, for when the agent needs to check the rendering
 itself.
 
-The actions are `focus`, `select`, `activate`, `set_text`, `expand`,
-`collapse`, `invoke` and `close_modal`.
+The actions are `focus`, `select`, `activate`, `set_text`, `set_checked`,
+`expand`, `collapse`, `invoke` and `close_modal`.
 
 ## Using the library
 
@@ -167,7 +189,7 @@ hbui_terminal::run(&shared)?;
 
 | crate | what it is |
 | --- | --- |
-| `hbui-core` | `UiState`, widgets (text, list, tree, input, button), layout (split, tabs, pane, modal), semantic actions, keymap, revisions and diffs, the semantic view. No terminal types. |
+| `hbui-core` | `UiState`, widgets (text, list, tree, input, button, checkbox, radio group), layout (split, tabs, pane, modal), menus, commands, semantic actions, the keymap, revisions and diffs, and the semantic view. No terminal types. |
 | `hbui-terminal` | Renders into a cell `Surface`, writes only the changed cells, normalizes crossterm input, and restores the terminal on drop and on panic. |
 | `hbui-ipc` | Sessions and the application ↔ bridge link: one Unix socket per session carrying JSON lines, a versioned handshake, per-session instance counters, and pushed views. The app side is `Endpoint` and the bridge side is `Bridge`. |
 | `hbui-mcp-bridge` | The stdio MCP server. It finds sessions and forwards `get_view` / `dispatch` / `capture_view` to the session named. It owns no UI state. |

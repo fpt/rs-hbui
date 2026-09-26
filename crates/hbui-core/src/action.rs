@@ -31,6 +31,12 @@ pub enum Action {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item: Option<String>,
     },
+    /// Set a checkbox on or off. Unlike `activate`, which toggles, this
+    /// says what the agent wants, so sending it twice does no harm.
+    SetChecked {
+        target: String,
+        checked: bool,
+    },
     /// Replace an input's whole text. The agent's way to type.
     SetText {
         target: String,
@@ -124,6 +130,9 @@ pub enum ActionError {
         modal: String,
     },
     NoModal,
+    CommandDisabled {
+        command: String,
+    },
     /// The application looked at the request and said no.
     Rejected {
         message: String,
@@ -147,6 +156,7 @@ impl ActionError {
             ActionError::NotVisible { .. } => "not_visible",
             ActionError::BlockedByModal { .. } => "blocked_by_modal",
             ActionError::NoModal => "no_modal",
+            ActionError::CommandDisabled { .. } => "command_disabled",
             ActionError::Rejected { .. } => "rejected",
         }
     }
@@ -197,6 +207,9 @@ impl std::fmt::Display for ActionError {
                 )
             }
             ActionError::NoModal => write!(f, "no modal is open"),
+            ActionError::CommandDisabled { command } => {
+                write!(f, "command {command:?} is disabled right now")
+            }
             ActionError::Rejected { message } => f.write_str(message),
         }
     }
@@ -229,6 +242,7 @@ pub(crate) fn apply(ui: &mut UiState, action: &Action) -> Result<Option<Event>, 
             let found = match widget_mut(ui, target)? {
                 Widget::List(l) => l.select(item),
                 Widget::Tree(t) => t.select(item),
+                Widget::Radio(r) => r.select(item),
                 other => return Err(unsupported(target, "select", other)),
             };
             if !found {
@@ -256,6 +270,13 @@ pub(crate) fn apply(ui: &mut UiState, action: &Action) -> Result<Option<Event>, 
                 Widget::List(l) => l.selected.clone(),
                 Widget::Tree(t) => t.selected.clone(),
                 Widget::Input(_) | Widget::Button(_) => None,
+                // Activating a checkbox toggles it, as Space does. Its value
+                // is read when its dialog is confirmed, so there is no event.
+                Widget::Checkbox(c) => {
+                    c.checked = !c.checked;
+                    ui.set_focus(target)?;
+                    return Ok(None);
+                }
                 other => return Err(unsupported(target, "activate", other)),
             };
             ui.set_focus(target)?;
@@ -263,6 +284,16 @@ pub(crate) fn apply(ui: &mut UiState, action: &Action) -> Result<Option<Event>, 
                 target: target.clone(),
                 item,
             }))
+        }
+
+        Action::SetChecked { target, checked } => {
+            ui.check_reachable(target)?;
+            match widget_mut(ui, target)? {
+                Widget::Checkbox(c) => c.checked = *checked,
+                other => return Err(unsupported(target, "set_checked", other)),
+            }
+            ui.set_focus(target)?;
+            Ok(None)
         }
 
         Action::SetText { target, value } => {
@@ -293,8 +324,13 @@ pub(crate) fn apply(ui: &mut UiState, action: &Action) -> Result<Option<Event>, 
         }
 
         Action::Invoke { command } => {
-            if !ui.commands.iter().any(|c| c.id == *command) {
+            let Some(c) = ui.command(command) else {
                 return Err(ActionError::UnknownCommand {
+                    command: command.clone(),
+                });
+            };
+            if !c.enabled {
+                return Err(ActionError::CommandDisabled {
                     command: command.clone(),
                 });
             }
@@ -303,6 +339,9 @@ pub(crate) fn apply(ui: &mut UiState, action: &Action) -> Result<Option<Event>, 
                     modal: m.id.clone(),
                 });
             }
+            // Choosing a command, from its menu or anywhere else, puts any
+            // pulled-down menu away.
+            ui.close_menu();
             Ok(Some(Event::Invoked {
                 command: command.clone(),
             }))

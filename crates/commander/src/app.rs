@@ -10,7 +10,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use hbui_core::{
-    Command, Controller, Event, Input, Item, Key, Layout, List, Size, UiState, Widget,
+    Command, Controller, Event, Input, Item, Key, Layout, List, Menu, MenuItem, RadioGroup, Size,
+    UiState, Widget,
 };
 
 pub const LEFT: &str = "left.files";
@@ -29,6 +30,31 @@ pub struct Commander {
     left: PathBuf,
     right: PathBuf,
     pending: Option<Pending>,
+    options: Options,
+}
+
+/// What Options → Panel options sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Options {
+    hidden: bool,
+    dirs_first: bool,
+    sort: Sort,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sort {
+    Name,
+    Size,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            hidden: true,
+            dirs_first: true,
+            sort: Sort::Name,
+        }
+    }
 }
 
 /// Build the UI and its controller, listing both directories.
@@ -50,15 +76,36 @@ pub fn build(left: PathBuf, right: PathBuf) -> (UiState, Commander) {
         Widget::text("Tab: switch pane  Enter: open  ^Q: quit"),
     );
     ui.commands = vec![
-        Command::new("rename", "Rename", Some(Key::F(2))),
-        Command::new("copy", "Copy", Some(Key::F(5))),
-        Command::new("mkdir", "Mkdir", Some(Key::F(7))),
-        Command::new("refresh", "Refresh", Some(Key::Ctrl('r'))),
+        Command::new("rename", "&Rename", Some(Key::F(2))),
+        Command::new("copy", "&Copy", Some(Key::F(5))),
+        Command::new("mkdir", "&Mkdir", Some(Key::F(7))),
+        Command::new("refresh", "Re&fresh", Some(Key::Ctrl('r'))),
+        Command::new("options", "&Panel options...", None),
+    ];
+    // Midnight Commander's F9 bar, cut down to what this commander does.
+    ui.menus = vec![
+        Menu::new(
+            "file",
+            "&File",
+            vec![
+                MenuItem::Command("rename".into()),
+                MenuItem::Command("copy".into()),
+                MenuItem::Command("mkdir".into()),
+                MenuItem::Separator,
+                MenuItem::Command("refresh".into()),
+            ],
+        ),
+        Menu::new(
+            "options",
+            "&Options",
+            vec![MenuItem::Command("options".into())],
+        ),
     ];
     let mut app = Commander {
         left,
         right,
         pending: None,
+        options: Options::default(),
     };
     app.refresh(&mut ui, LEFT);
     app.refresh(&mut ui, RIGHT);
@@ -94,7 +141,7 @@ impl Commander {
     /// name still exists, which is what the list's id-based selection buys.
     fn refresh(&mut self, ui: &mut UiState, pane: &str) {
         let dir = self.dir(pane).to_path_buf();
-        let items = match list_dir(&dir) {
+        let items = match list_dir(&dir, &self.options) {
             Ok(items) => items,
             Err(e) => {
                 ui.set_text(STATUS, format!("cannot read {}: {e}", dir.display()));
@@ -198,8 +245,37 @@ impl Commander {
                     "Copy",
                     vec![
                         ("copy.question".into(), Widget::text(question)),
-                        ("copy.ok".into(), Widget::button("Copy")),
-                        ("copy.cancel".into(), Widget::button("Cancel")),
+                        ("copy.ok".into(), Widget::default_button("&OK")),
+                        ("copy.cancel".into(), Widget::button("&Cancel")),
+                    ],
+                );
+            }
+            "options" => {
+                let o = self.options;
+                let sort = match o.sort {
+                    Sort::Name => "name",
+                    Sort::Size => "size",
+                };
+                let mut order = RadioGroup::new(
+                    "Sort by",
+                    vec![Item::new("name", "Name"), Item::new("size", "Size")],
+                );
+                order.select(sort);
+                ui.open_modal(
+                    "options",
+                    "Panel options",
+                    vec![
+                        (
+                            "options.hidden".into(),
+                            Widget::checkbox("Show &hidden files", o.hidden),
+                        ),
+                        (
+                            "options.dirs_first".into(),
+                            Widget::checkbox("&Directories first", o.dirs_first),
+                        ),
+                        ("options.sort".into(), Widget::Radio(order)),
+                        ("options.ok".into(), Widget::default_button("&OK")),
+                        ("options.cancel".into(), Widget::button("&Cancel")),
                     ],
                 );
             }
@@ -270,6 +346,10 @@ impl Controller for Commander {
                     ui.close_modal();
                     Ok(())
                 }
+                Some(("options", "ok")) => {
+                    self.apply_options(ui);
+                    Ok(())
+                }
                 Some((modal, "ok" | "name")) if ui.modal().is_some_and(|m| m.id == modal) => {
                     let modal = modal.to_string();
                     self.confirm(ui, &modal)
@@ -283,6 +363,43 @@ impl Controller for Commander {
             }
         }
     }
+
+    /// Keep Rename and Copy usable only when the active pane's selection is
+    /// something they can act on. Runs on every change, so a person arrowing
+    /// through the list and an agent selecting by id both see the same
+    /// enabled state.
+    fn settle(&mut self, ui: &mut UiState) {
+        if ui.modal().is_some() {
+            return;
+        }
+        let pane = Self::active_pane(ui);
+        let selected = Self::selected_name(ui, pane);
+        let is_file = selected
+            .as_ref()
+            .is_some_and(|n| !self.dir(pane).join(n).is_dir());
+        ui.set_enabled("rename", selected.is_some());
+        ui.set_enabled("copy", is_file);
+    }
+}
+
+impl Commander {
+    /// OK in Panel options: read the dialog back, then re-list both panes.
+    fn apply_options(&mut self, ui: &mut UiState) {
+        let checked = |id: &str| matches!(ui.widget(id), Some(Widget::Checkbox(c)) if c.checked);
+        let sort = match ui.widget("options.sort") {
+            Some(Widget::Radio(r)) if r.selected.as_deref() == Some("size") => Sort::Size,
+            _ => Sort::Name,
+        };
+        self.options = Options {
+            hidden: checked("options.hidden"),
+            dirs_first: checked("options.dirs_first"),
+            sort,
+        };
+        ui.close_modal();
+        self.refresh(ui, LEFT);
+        self.refresh(ui, RIGHT);
+        ui.set_text(STATUS, "panel options applied");
+    }
 }
 
 /// A prompt, a text field and OK / Cancel.
@@ -293,28 +410,42 @@ fn form(id: &str, prompt: &str, value: &str) -> Vec<(hbui_core::WidgetId, Widget
             format!("{id}.name").into(),
             Widget::Input(Input::new("Name", value)),
         ),
-        (format!("{id}.ok").into(), Widget::button("OK")),
-        (format!("{id}.cancel").into(), Widget::button("Cancel")),
+        (format!("{id}.ok").into(), Widget::default_button("&OK")),
+        (format!("{id}.cancel").into(), Widget::button("&Cancel")),
     ]
 }
 
-fn list_dir(dir: &Path) -> std::io::Result<Vec<Item>> {
-    let mut entries: Vec<(bool, String)> = fs::read_dir(dir)?
+fn list_dir(dir: &Path, options: &Options) -> std::io::Result<Vec<Item>> {
+    let mut entries: Vec<(bool, String, u64)> = fs::read_dir(dir)?
         .filter_map(Result::ok)
         .map(|e| {
+            let path = e.path();
             (
-                e.path().is_dir(),
+                path.is_dir(),
                 e.file_name().to_string_lossy().into_owned(),
+                e.metadata().map(|m| m.len()).unwrap_or(0),
             )
         })
+        .filter(|(_, name, _)| options.hidden || !name.starts_with('.'))
         .collect();
-    // Directories first, then by name — the order every commander uses.
-    entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    entries.sort_by(|a, b| {
+        let dirs = if options.dirs_first {
+            b.0.cmp(&a.0)
+        } else {
+            std::cmp::Ordering::Equal
+        };
+        let key = match options.sort {
+            Sort::Name => a.1.cmp(&b.1),
+            // Largest first, as Midnight Commander sorts by size.
+            Sort::Size => b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)),
+        };
+        dirs.then(key)
+    });
     let mut items = Vec::with_capacity(entries.len() + 1);
     if dir.parent().is_some() {
         items.push(Item::new(PARENT, "../"));
     }
-    items.extend(entries.into_iter().map(|(is_dir, name)| {
+    items.extend(entries.into_iter().map(|(is_dir, name, _)| {
         let label = if is_dir {
             format!("{name}/")
         } else {
@@ -560,5 +691,112 @@ mod tests {
         ses.input(&InputEvent::Key(Key::Esc)).unwrap();
         assert_eq!(ses.view()["modal"], Value::Null);
         assert!(!s.0.join("a/new").exists());
+    }
+
+    /// Rename and Copy follow the selection, however it moved.
+    #[test]
+    fn commands_are_enabled_only_for_what_they_can_act_on() {
+        let s = Scratch::new("enabled");
+        let mut ses = session(&s);
+        let enabled = |ses: &Session, id: &str| {
+            ses.view()["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["id"] == id)
+                .map(|c| c.get("enabled").is_none())
+                .unwrap()
+        };
+        // `..` is selected: nothing to rename or copy.
+        assert!(!enabled(&ses, "rename") && !enabled(&ses, "copy"));
+        // A directory can be renamed but not copied.
+        ses.input(&InputEvent::Key(Key::Down)).unwrap();
+        assert!(enabled(&ses, "rename") && !enabled(&ses, "copy"));
+        // A file, selected by an agent this time: both.
+        act(
+            &mut ses,
+            Action::Select {
+                target: LEFT.into(),
+                item: "notes.txt".into(),
+            },
+        )
+        .unwrap();
+        assert!(enabled(&ses, "rename") && enabled(&ses, "copy"));
+    }
+
+    /// The Panel options dialog, driven by an agent, changes what is listed.
+    #[test]
+    fn panel_options_hide_dot_files_and_sort_by_size() {
+        let s = Scratch::new("options");
+        fs::write(s.0.join("a/.hidden"), "").unwrap();
+        fs::write(s.0.join("a/big.bin"), vec![0u8; 4096]).unwrap();
+        let mut ses = session(&s);
+        assert!(items(&ses.view(), LEFT).contains(&".hidden".to_string()));
+
+        act(
+            &mut ses,
+            Action::Invoke {
+                command: "options".into(),
+            },
+        )
+        .unwrap();
+        act(
+            &mut ses,
+            Action::SetChecked {
+                target: "options.hidden".into(),
+                checked: false,
+            },
+        )
+        .unwrap();
+        act(
+            &mut ses,
+            Action::SetChecked {
+                target: "options.dirs_first".into(),
+                checked: false,
+            },
+        )
+        .unwrap();
+        act(
+            &mut ses,
+            Action::Select {
+                target: "options.sort".into(),
+                item: "size".into(),
+            },
+        )
+        .unwrap();
+        act(
+            &mut ses,
+            Action::Activate {
+                target: "options.ok".into(),
+                item: None,
+            },
+        )
+        .unwrap();
+
+        let v = ses.view();
+        assert_eq!(v["modal"], Value::Null);
+        assert_eq!(
+            items(&v, LEFT)[1],
+            "big.bin",
+            "largest first, directories mixed in"
+        );
+        assert!(!items(&v, LEFT).contains(&".hidden".to_string()));
+    }
+
+    /// A person reaches the same dialog through F9 and the menu hotkeys.
+    #[test]
+    fn a_person_opens_panel_options_from_the_menu() {
+        let s = Scratch::new("menu");
+        let mut ses = session(&s);
+        for k in [Key::F(9), Key::Char('o'), Key::Char('p')] {
+            ses.input(&InputEvent::Key(k)).unwrap();
+        }
+        assert_eq!(ses.view()["modal"]["id"], "options");
+        ses.input(&InputEvent::Key(Key::Char('h'))).unwrap(); // Show &hidden files: off
+        ses.input(&InputEvent::Key(Key::Enter)).unwrap(); // the default button
+        assert_eq!(
+            ses.view()["widgets"][STATUS]["value"],
+            "panel options applied"
+        );
     }
 }

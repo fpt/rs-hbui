@@ -20,8 +20,11 @@ use crate::widget::{Input, List, Tree, Widget, WidgetId};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Command {
     pub id: String,
+    /// May mark a hotkey with `&`, used when the command is in a menu.
     pub label: String,
     pub key: Option<Key>,
+    /// A disabled command is listed, drawn dimmed, and refused.
+    pub enabled: bool,
 }
 
 impl Command {
@@ -30,8 +33,49 @@ impl Command {
             id: id.into(),
             label: label.into(),
             key,
+            enabled: true,
         }
     }
+}
+
+/// One pull-down menu of the menu bar, as in Midnight Commander's F9 bar.
+///
+/// A menu holds no actions of its own, only command ids: choosing an item is
+/// `invoke` of that command, whoever does it. An agent never needs to open a
+/// menu to use what is in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Menu {
+    pub id: String,
+    /// May mark a hotkey with `&`, as in `&File`.
+    pub label: String,
+    pub items: Vec<MenuItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuItem {
+    Command(String),
+    Separator,
+}
+
+impl Menu {
+    pub fn new(id: impl Into<String>, label: impl Into<String>, items: Vec<MenuItem>) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            items,
+        }
+    }
+}
+
+/// Which menu a person has pulled down, and which item is highlighted.
+///
+/// Part of the state, not of the terminal, so the agent can see that the
+/// person is in a menu, and the renderer draws it from here like anything
+/// else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenMenu {
+    pub menu: String,
+    pub highlighted: Option<String>,
 }
 
 /// The one dialog that may sit on top of the screen.
@@ -56,6 +100,8 @@ pub struct UiState {
     focus: Option<WidgetId>,
     modal: Option<Modal>,
     pub commands: Vec<Command>,
+    pub menus: Vec<Menu>,
+    open_menu: Option<OpenMenu>,
 }
 
 impl UiState {
@@ -67,6 +113,8 @@ impl UiState {
             focus: None,
             modal: None,
             commands: Vec::new(),
+            menus: Vec::new(),
+            open_menu: None,
         }
     }
 
@@ -236,6 +284,8 @@ impl UiState {
         for (wid, w) in widgets {
             self.widgets.insert(wid, w);
         }
+        // A dialog opened from a menu replaces the menu.
+        self.open_menu = None;
         self.modal = Some(Modal {
             id: id.into(),
             title: title.into(),
@@ -255,6 +305,89 @@ impl UiState {
         self.focus = modal.return_focus.clone();
         self.ensure_focus();
         Some(modal)
+    }
+
+    pub fn command(&self, id: &str) -> Option<&Command> {
+        self.commands.iter().find(|c| c.id == id)
+    }
+
+    /// Enable or disable a command — Copy when nothing copyable is selected,
+    /// say. Its menu item and key bar entry dim with it.
+    pub fn set_enabled(&mut self, id: &str, enabled: bool) {
+        if let Some(c) = self.commands.iter_mut().find(|c| c.id == id) {
+            c.enabled = enabled;
+        }
+    }
+
+    pub fn open_menu(&self) -> Option<&OpenMenu> {
+        self.open_menu.as_ref()
+    }
+
+    /// Pull a menu down, highlighting its first usable item. `false` if there
+    /// is no such menu, or a modal is open — a menu never sits over a dialog.
+    pub fn pull_down(&mut self, menu: &str) -> bool {
+        if self.modal.is_some() {
+            return false;
+        }
+        let Some(m) = self.menus.iter().find(|m| m.id == menu) else {
+            return false;
+        };
+        let highlighted = self.usable(m).first().map(|s| s.to_string());
+        self.open_menu = Some(OpenMenu {
+            menu: menu.to_string(),
+            highlighted,
+        });
+        true
+    }
+
+    pub fn close_menu(&mut self) {
+        self.open_menu = None;
+    }
+
+    /// Pull down the menu `delta` places along the bar, wrapping.
+    pub fn switch_menu(&mut self, delta: isize) {
+        let Some(open) = &self.open_menu else { return };
+        let Some(at) = self.menus.iter().position(|m| m.id == open.menu) else {
+            return;
+        };
+        let to = (at as isize + delta).rem_euclid(self.menus.len() as isize) as usize;
+        let id = self.menus[to].id.clone();
+        self.pull_down(&id);
+    }
+
+    /// Move the highlight `delta` usable items, clamped — separators and
+    /// disabled commands are stepped over.
+    pub fn move_highlight(&mut self, delta: isize) {
+        let Some(open) = &self.open_menu else { return };
+        let Some(menu) = self.menus.iter().find(|m| m.id == open.menu) else {
+            return;
+        };
+        let usable = self.usable(menu);
+        if usable.is_empty() {
+            return;
+        }
+        let at = open
+            .highlighted
+            .as_deref()
+            .and_then(|h| usable.iter().position(|u| *u == h))
+            .unwrap_or(0) as isize;
+        let to = at.saturating_add(delta).clamp(0, usable.len() as isize - 1) as usize;
+        let next = usable[to].to_string();
+        if let Some(open) = &mut self.open_menu {
+            open.highlighted = Some(next);
+        }
+    }
+
+    /// The command ids in `menu` that can be chosen, in order.
+    fn usable<'a>(&'a self, menu: &'a Menu) -> Vec<&'a str> {
+        menu.items
+            .iter()
+            .filter_map(|i| match i {
+                MenuItem::Command(id) => Some(id.as_str()),
+                MenuItem::Separator => None,
+            })
+            .filter(|id| self.command(id).is_some_and(|c| c.enabled))
+            .collect()
     }
 }
 
