@@ -1,0 +1,58 @@
+# What `make check` runs, on every push and pull request.
+#
+# Deliberately the same commands the Makefile names, rather than a second
+# definition of "is this good" that drifts from the one people run locally.
+
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to a branch makes the first run irrelevant.
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('crates/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Versions
+        run: cargo --version && cargo clippy --version
+
+      - name: Test
+        run: make test
+
+      - name: Lint
+        run: make lint
+
+      - name: Format
+        run: make fmt-check
+
+      # The one end-to-end check a headless runner can make: drive the real
+      # binary over MCP stdio and confirm the agent's half answers.
+      - name: MCP smoke test
+        run: |
+          cd crates && cargo build && cd ..
+          printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_view","arguments":{}}}' \
+            | ./crates/target/debug/commander mcp . | grep -q '\\"revision\\":1'

@@ -1,0 +1,17 @@
+[package]
+name = "hbui-commander"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "A Norton Commander-style two-pane file browser: the proof that one UiState can be driven by a person and an agent at once."
+
+[[bin]]
+name = "commander"
+path = "src/main.rs"
+
+[dependencies]
+hbui-core.workspace = true
+hbui-terminal.workspace = true
+hbui-mcp.workspace = true
+serde_json.workspace = true

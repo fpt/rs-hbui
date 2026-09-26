@@ -1,0 +1,12 @@
+[package]
+name = "hbui-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The AI half: serves a hbui session over MCP (stdio or streamable HTTP) as two tools, get_view and dispatch."
+
+[dependencies]
+hbui-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
