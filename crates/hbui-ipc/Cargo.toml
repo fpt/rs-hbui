@@ -1,10 +1,10 @@
 [package]
-name = "hbui-mcp"
+name = "hbui-ipc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "The AI half: serves a hbui session over MCP (stdio or streamable HTTP) as two tools, get_view and dispatch."
+description = "The local link between a hbui application and hbui-mcp-bridge: a Unix socket, JSON lines, a versioned handshake and instance ids."
 
 [dependencies]
 hbui-core.workspace = true

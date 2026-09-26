@@ -1,10 +1,15 @@
 //! `commander` — a two-pane file browser that a person and an agent can use
 //! at the same time.
 //!
+//! The agent reaches it through `hbui-mcp-bridge`, never directly: the
+//! commander connects out to the bridge's socket (and keeps retrying while
+//! there is none), so it can be rebuilt and restarted while the agent stays
+//! connected to the bridge.
+//!
 //! ```text
-//! commander [LEFT [RIGHT]]              the terminal UI
-//! commander --mcp[=PORT] [LEFT [RIGHT]] ... also serving MCP on 127.0.0.1:PORT/mcp
-//! commander mcp [LEFT [RIGHT]]          headless, MCP over stdio
+//! commander [--socket PATH] [LEFT [RIGHT]]   the terminal UI
+//! commander --headless [LEFT [RIGHT]]        no terminal; only the agent drives it
+//! commander --no-bridge [LEFT [RIGHT]]       the terminal UI, not reachable by an agent
 //! ```
 
 mod app;
@@ -14,50 +19,50 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use hbui_core::{Session, Shared};
-use hbui_mcp::Server;
+use hbui_ipc::{default_socket, Endpoint, Link};
 
 const NAME: &str = "commander";
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-const DEFAULT_PORT: u16 = 8740;
 
 const USAGE: &str = "\
-usage: commander [--mcp[=PORT]] [LEFT [RIGHT]]
-       commander mcp [LEFT [RIGHT]]
+usage: commander [--socket PATH | --no-bridge] [--headless] [LEFT [RIGHT]]
 
-  --mcp[=PORT]  also serve MCP over HTTP on 127.0.0.1:PORT/mcp (default 8740)
-  mcp           no terminal UI; serve MCP over stdio
+  --socket PATH  the hbui-mcp-bridge socket to connect to (default: $HBUI_SOCKET,
+                 or hbui-dev-$USER.sock in the temp dir)
+  --no-bridge    do not connect to a bridge
+  --headless     no terminal UI; run until killed, driven only through the bridge
 
 keys: Tab switch pane, Enter open, F2 rename, F5 copy, F7 mkdir, ^R refresh, ^Q quit";
 
 struct Args {
-    stdio: bool,
-    http: Option<u16>,
+    socket: Option<PathBuf>,
+    bridge: bool,
+    headless: bool,
     dirs: Vec<PathBuf>,
 }
 
 fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut out = Args {
-        stdio: false,
-        http: None,
+        socket: None,
+        bridge: true,
+        headless: false,
         dirs: Vec::new(),
     };
-    for (i, arg) in args.enumerate() {
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
         match arg.as_str() {
-            "mcp" if i == 0 => out.stdio = true,
-            "--mcp" => out.http = Some(DEFAULT_PORT),
+            "--socket" => out.socket = Some(args.next().ok_or("--socket needs a path")?.into()),
+            "--no-bridge" => out.bridge = false,
+            "--headless" => out.headless = true,
             "-h" | "--help" => return Err(String::new()),
-            a if a.starts_with("--mcp=") => {
-                let port = a["--mcp=".len()..]
-                    .parse()
-                    .map_err(|_| format!("bad port in {a}"))?;
-                out.http = Some(port);
-            }
             a if a.starts_with('-') => return Err(format!("unknown option {a}")),
             a => out.dirs.push(PathBuf::from(a)),
         }
     }
     if out.dirs.len() > 2 {
         return Err("at most two directories".into());
+    }
+    if out.headless && !out.bridge {
+        return Err("--headless with --no-bridge would be driven by nobody".into());
     }
     Ok(out)
 }
@@ -84,29 +89,39 @@ fn main() -> ExitCode {
 
     let (ui, app) = app::build(left, right);
     let shared = Shared::new(Session::new(ui, app));
-    let server = Server::new(shared.clone(), NAME, VERSION).with_capture(Arc::new(|ui, w, h| {
-        hbui_terminal::render(ui, w, h).surface.to_text()
-    }));
 
-    if args.stdio {
-        eprintln!("{NAME} {VERSION}: serving MCP on stdio");
-        hbui_mcp::serve_stdio(&server);
-        return ExitCode::SUCCESS;
+    if args.bridge {
+        let socket = args.socket.unwrap_or_else(default_socket);
+        let status = shared.clone();
+        let headless = args.headless;
+        Endpoint::new(shared.clone(), &socket, NAME)
+            .with_capture(Arc::new(|ui, w, h| {
+                hbui_terminal::render(ui, w, h).surface.to_text()
+            }))
+            .on_link(move |link| {
+                let text = match link {
+                    Link::Connected { instance } => {
+                        format!("bridge: connected, instance {instance}")
+                    }
+                    Link::Disconnected => "bridge: waiting".to_string(),
+                    Link::Rejected { reason } => format!("bridge: {reason}"),
+                };
+                if headless {
+                    eprintln!("{NAME}: {text}");
+                }
+                // The terminal belongs to the UI, so the person reads this in
+                // the status line rather than on stderr.
+                status
+                    .lock()
+                    .update(|ui| ui.set_text(app::STATUS, format!("{text}  ^Q: quit")));
+            })
+            .spawn();
     }
 
-    if let Some(port) = args.http {
-        match hbui_mcp::serve_http(Arc::new(server), port) {
-            Ok(addr) => {
-                // The terminal is about to be taken over, so the address goes
-                // where the person will see it: the status line.
-                shared.lock().update(|ui| {
-                    ui.set_text(app::STATUS, format!("MCP: http://{addr}/mcp  ^Q: quit"))
-                });
-            }
-            Err(e) => {
-                eprintln!("{NAME}: cannot listen on 127.0.0.1:{port}: {e}");
-                return ExitCode::FAILURE;
-            }
+    if args.headless {
+        eprintln!("{NAME}: headless (pid {})", std::process::id());
+        loop {
+            std::thread::park();
         }
     }
 

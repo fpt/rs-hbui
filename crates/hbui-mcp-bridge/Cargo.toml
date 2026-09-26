@@ -1,0 +1,20 @@
+[package]
+name = "hbui-mcp-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "A long-lived MCP server that forwards get_view / dispatch / capture_view to whichever hbui application is connected, so the application can restart without the agent reconnecting."
+
+[[bin]]
+name = "hbui-mcp-bridge"
+path = "src/main.rs"
+
+[dependencies]
+hbui-ipc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+# Tests stand a real application session up behind the bridge.
+hbui-core.workspace = true

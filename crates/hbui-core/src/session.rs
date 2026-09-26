@@ -61,12 +61,12 @@ pub struct Session {
 impl Session {
     pub fn new(mut ui: UiState, controller: impl Controller + 'static) -> Self {
         ui.ensure_focus();
-        ui.set_revision(1);
+        ui.set_revision(0);
         let body = view_body(&ui);
         Self {
             ui,
             controller: Box::new(controller),
-            history: VecDeque::from([(1, body)]),
+            history: VecDeque::from([(0, body)]),
         }
     }
 
@@ -111,7 +111,7 @@ impl Session {
     pub fn dispatch(&mut self, req: ActionRequest) -> Result<Outcome, ActionError> {
         if let Some(expected) = req.expected_revision {
             if expected != self.revision() {
-                return Err(ActionError::StaleView {
+                return Err(ActionError::StaleRevision {
                     current_revision: self.revision(),
                 });
             }

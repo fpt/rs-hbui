@@ -13,5 +13,10 @@ path = "src/main.rs"
 [dependencies]
 hbui-core.workspace = true
 hbui-terminal.workspace = true
-hbui-mcp.workspace = true
+hbui-ipc.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+# The lifecycle test runs a real bridge in-process against real commander
+# processes it starts, stops and restarts.
+hbui-mcp-bridge = { path = "../hbui-mcp-bridge" }

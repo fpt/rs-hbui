@@ -59,7 +59,7 @@ pub struct ActionRequest {
     #[serde(flatten)]
     pub action: Action,
     /// When present and not the current revision, the action is refused as
-    /// [`ActionError::StaleView`] — something (usually the person at the
+    /// [`ActionError::StaleRevision`] — something (usually the person at the
     /// keyboard) changed the UI since the sender last looked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_revision: Option<u64>,
@@ -98,7 +98,7 @@ pub enum Event {
 /// code it can branch on, and a message it can read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionError {
-    StaleView {
+    StaleRevision {
         current_revision: u64,
     },
     UnknownTarget {
@@ -139,7 +139,7 @@ impl ActionError {
 
     pub fn code(&self) -> &'static str {
         match self {
-            ActionError::StaleView { .. } => "stale_view",
+            ActionError::StaleRevision { .. } => "stale_revision",
             ActionError::UnknownTarget { .. } => "unknown_target",
             ActionError::UnknownItem { .. } => "unknown_item",
             ActionError::UnknownCommand { .. } => "unknown_command",
@@ -154,7 +154,7 @@ impl ActionError {
     pub fn to_json(&self) -> Value {
         let mut v = json!({ "ok": false, "error": self.code(), "message": self.to_string() });
         match self {
-            ActionError::StaleView { current_revision } => {
+            ActionError::StaleRevision { current_revision } => {
                 v["current_revision"] = json!(current_revision);
             }
             ActionError::BlockedByModal { modal } => v["modal"] = json!(modal),
@@ -167,7 +167,7 @@ impl ActionError {
 impl std::fmt::Display for ActionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ActionError::StaleView { current_revision } => write!(
+            ActionError::StaleRevision { current_revision } => write!(
                 f,
                 "the view changed since you read it (now revision {current_revision}); \
                  read it again before acting"
@@ -354,12 +354,12 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_view_error_says_where_the_view_is_now() {
-        let v = ActionError::StaleView {
+    fn a_stale_revision_error_says_where_the_view_is_now() {
+        let v = ActionError::StaleRevision {
             current_revision: 43,
         }
         .to_json();
-        assert_eq!(v["error"], "stale_view");
+        assert_eq!(v["error"], "stale_revision");
         assert_eq!(v["current_revision"], 43);
     }
 }

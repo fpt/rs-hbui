@@ -96,7 +96,8 @@ name = "hbui-commander"
 version = "0.1.0"
 dependencies = [
  "hbui-core",
- "hbui-mcp",
+ "hbui-ipc",
+ "hbui-mcp-bridge",
  "hbui-terminal",
  "serde_json",
 ]
@@ -112,10 +113,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "hbui-mcp"
+name = "hbui-ipc"
 version = "0.1.0"
 dependencies = [
  "hbui-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "hbui-mcp-bridge"
+version = "0.1.0"
+dependencies = [
+ "hbui-core",
+ "hbui-ipc",
  "serde",
  "serde_json",
 ]

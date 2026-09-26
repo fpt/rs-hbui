@@ -89,7 +89,7 @@ fn select(target: &str, item: &str) -> Action {
 #[test]
 fn semantic_snapshot_of_the_initial_view() {
     let v = session().view();
-    assert_eq!(v["revision"], 1);
+    assert_eq!(v["revision"], 0);
     assert_eq!(v["focus"], "left.files");
     assert_eq!(v["modal"], json!(null));
     assert_eq!(
@@ -122,7 +122,7 @@ fn an_action_reports_exactly_what_it_changed() {
     let out = s
         .dispatch(select("left.files", "documents").into())
         .unwrap();
-    assert_eq!(out.revision, 2);
+    assert_eq!(out.revision, 1);
     assert_eq!(
         serde_json::to_value(&out.changes).unwrap(),
         json!([{"op": "replace", "path": "/widgets/left.files/selected", "value": "documents"}])
@@ -133,14 +133,14 @@ fn an_action_reports_exactly_what_it_changed() {
 fn an_action_that_changes_nothing_does_not_move_the_revision() {
     let mut s = session();
     let out = s.dispatch(select("left.files", "root").into()).unwrap();
-    assert_eq!(out.revision, 1);
+    assert_eq!(out.revision, 0);
     assert!(out.changes.is_empty());
 }
 
 #[test]
 fn a_stale_revision_is_refused_without_effect() {
     let mut s = session();
-    // The agent looks at revision 1 ...
+    // The agent looks at revision 0 ...
     let seen = s.revision();
     // ... the person presses Down in the meantime ...
     s.input(&InputEvent::Key(Key::Down)).unwrap();
@@ -153,8 +153,8 @@ fn a_stale_revision_is_refused_without_effect() {
         .unwrap_err();
     assert_eq!(
         err,
-        ActionError::StaleView {
-            current_revision: 2
+        ActionError::StaleRevision {
+            current_revision: 1
         }
     );
     assert_eq!(s.view()["widgets"]["left.files"]["selected"], "documents");
@@ -199,14 +199,14 @@ fn get_view_since_returns_the_changes_in_between() {
         .unwrap();
     s.dispatch(select("left.files", "download").into()).unwrap();
     assert_eq!(
-        s.view_since(1),
+        s.view_since(0),
         json!({
-            "revision": 3,
-            "since": 1,
+            "revision": 2,
+            "since": 0,
             "changes": [{"op": "replace", "path": "/widgets/left.files/selected", "value": "download"}],
         })
     );
-    assert_eq!(s.view_since(3)["changes"], json!([]));
+    assert_eq!(s.view_since(2)["changes"], json!([]));
     assert_eq!(s.view_since(999)["full"], true);
 }
 

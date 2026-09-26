@@ -47,12 +47,14 @@ jobs:
       - name: Format
         run: make fmt-check
 
-      # The one end-to-end check a headless runner can make: drive the real
-      # binary over MCP stdio and confirm the agent's half answers.
-      - name: MCP smoke test
+      # `make test` already runs the bridge lifecycle scenario against real
+      # commander processes. This adds the one thing it cannot: the bridge
+      # *binary*, spoken to over stdio, answering with no application behind it.
+      - name: Bridge smoke test
         run: |
           cd crates && cargo build && cd ..
           printf '%s\n' \
             '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
             '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_view","arguments":{}}}' \
-            | ./crates/target/debug/commander mcp . | grep -q '\\"revision\\":1'
+            | ./crates/target/debug/hbui-mcp-bridge --socket "$RUNNER_TEMP/hbui.sock" \
+            | grep -q 'application_unavailable'

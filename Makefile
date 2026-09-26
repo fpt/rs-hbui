@@ -1,7 +1,7 @@
 PREFIX ?= $(HOME)
 CARGO  ?= cargo
 
-.PHONY: build release test lint fmt fmt-check check run run-mcp install clean
+.PHONY: build release test lint fmt fmt-check check bridge run install clean
 
 build:
 	cd crates && $(CARGO) build
@@ -28,18 +28,19 @@ check: test lint fmt-check
 
 DIR ?= .
 
-# The terminal UI alone.
+# The long-lived half: MCP on 127.0.0.1:8740/mcp. Leave it running.
+bridge: build
+	./crates/target/debug/hbui-mcp-bridge --http
+
+# The short-lived half: restart it as often as you like; it reconnects.
 run: build
 	./crates/target/debug/commander $(DIR)
 
-# The terminal UI, also serving MCP on 127.0.0.1:8740/mcp.
-run-mcp: build
-	./crates/target/debug/commander --mcp $(DIR)
-
 install: release
 	install -d $(PREFIX)/bin
+	install -m 755 crates/target/release/hbui-mcp-bridge $(PREFIX)/bin/hbui-mcp-bridge
 	install -m 755 crates/target/release/commander $(PREFIX)/bin/hbui-commander
-	@echo "installed $(PREFIX)/bin/hbui-commander"
+	@echo "installed $(PREFIX)/bin/hbui-mcp-bridge and $(PREFIX)/bin/hbui-commander"
 
 clean:
 	cd crates && $(CARGO) clean

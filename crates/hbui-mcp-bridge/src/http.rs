@@ -1,9 +1,5 @@
-//! MCP over streamable HTTP, the transport that lets a person and an agent
-//! share one live UI.
-//!
-//! Stdio would have the agent's client own the process and its stdout, which
-//! is exactly what the person's terminal needs. A socket leaves the terminal
-//! alone: the application runs in it as usual and also listens here.
+//! MCP over streamable HTTP, for a bridge left running across agent
+//! sessions as well as application restarts.
 //!
 //! Only the request/response half of the transport is implemented: `POST
 //! /mcp` answers with one JSON body. This server never has anything to say

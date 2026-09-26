@@ -1,8 +1,9 @@
 //! MCP over stdio: one JSON-RPC message per line.
 //!
 //! **stdout is the protocol channel.** Every diagnostic goes to stderr, or the
-//! first stray print desynchronises the session. It also means stdio cannot
-//! share a terminal with a person — see [`crate::http`] for that.
+//! first stray print desynchronises the session. The bridge is then a child
+//! of the agent's client — which is fine: the application, the part that
+//! restarts, is a separate process either way.
 
 use std::io::{BufRead, Write};
 

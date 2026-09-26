@@ -3,7 +3,8 @@ resolver = "2"
 members = [
     "hbui-core",
     "hbui-terminal",
-    "hbui-mcp",
+    "hbui-ipc",
+    "hbui-mcp-bridge",
     "commander",
 ]
 
@@ -16,7 +17,7 @@ authors = ["rs-hbui Contributors"]
 [workspace.dependencies]
 hbui-core = { path = "hbui-core" }
 hbui-terminal = { path = "hbui-terminal" }
-hbui-mcp = { path = "hbui-mcp" }
+hbui-ipc = { path = "hbui-ipc" }
 
 # The semantic view is JSON, and so is the MCP wire. A JSON parser is the one
 # piece worth buying rather than owning.
