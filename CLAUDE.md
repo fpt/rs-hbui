@@ -20,10 +20,13 @@ crates/                 cargo workspace (run cargo from here, or use the Makefil
                         (app side: Endpoint, listens; bridge side: Bridge, scans)
   hbui-mcp-bridge/      stdio MCP server binary: wire, tools; forwards over hbui-ipc
   commander/            two-pane file browser PoC (binary `commander`)
+    examples/todo.rs    the smallest complete hbui program (the skills point at it)
     tests/bridge_lifecycle.rs   the MCP_BRIDGE.md success scenario, with real processes
 docs/DESIGN.md          the design
 docs/MCP_BRIDGE.md      the bridge and the development lifecycle
 docs/SESSIONS.md        several applications: sessions, instances, pids
+skills/hbui-building/   agent skill: writing a UI with hbui
+skills/hbui-driving/    agent skill: operating a running app via the MCP tools
 ```
 
 Dependencies point only downward. `hbui-core` knows nothing of terminals,
@@ -141,6 +144,9 @@ committing.
   the bridge, IPC or instance semantics must keep it passing.
 
 ## Adding things
+
+Keep `skills/` true: a change to widgets, actions, tools or error codes
+updates `skills/hbui-building` / `skills/hbui-driving` in the same change.
 
 - **A new widget:** add it to `Widget`, `role`/`focusable`/`actions`, then
   `view::widget_view`, `keymap::for_focused`, `action::apply` and
