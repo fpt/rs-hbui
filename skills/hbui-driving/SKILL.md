@@ -20,6 +20,9 @@ see what they do.
 | `dispatch {session, type, …, expected_instance, expected_revision}` | One semantic action |
 | `capture_view {session, width?, height?}` | What the person's screen shows, as text. For checking the drawing, not for working from |
 
+The server has these tools and nothing else: no resources, no prompts. Don't
+look for them; start with `list_sessions`.
+
 Name the `session` on every call. There is no current session. `pid` also
 works as a selector, but pids change on restart and sessions don't.
 
