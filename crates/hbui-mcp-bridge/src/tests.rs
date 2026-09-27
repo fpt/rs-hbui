@@ -182,3 +182,32 @@ fn stale_expectations_are_refused() {
     assert_eq!(tool_json(&r[4])["widgets"]["files"]["selected"], "b");
     assert_eq!(tool_json(&r[5])["error"], "not_supported");
 }
+
+/// Clients that ask for resources or prompts get empty lists and carry on;
+/// anything else unknown gets an error that says what is here.
+#[test]
+fn unknown_methods_point_at_the_tools() {
+    let dir = Dir::new("methods");
+    let r = session(
+        &Server::new(Bridge::new(&dir.0), "0"),
+        &[
+            json!({"jsonrpc": "2.0", "id": 1, "method": "resources/list"}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "resources/templates/list"}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "prompts/list"}),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "resources/read", "params": {"uri": "x"}}),
+            call(5, "screenshot", json!({})),
+        ],
+    );
+    assert_eq!(r[0]["result"], json!({"resources": []}));
+    assert_eq!(r[1]["result"], json!({"resourceTemplates": []}));
+    assert_eq!(r[2]["result"], json!({"prompts": []}));
+    let message = r[3]["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("tools only") && message.contains("list_sessions"),
+        "{message}"
+    );
+    assert!(tool_json(&r[4])["message"]
+        .as_str()
+        .unwrap()
+        .contains("list_sessions"));
+}

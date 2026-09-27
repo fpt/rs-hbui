@@ -19,6 +19,11 @@ use crate::wire::{
 
 pub const NAME: &str = "hbui-mcp-bridge";
 
+/// Said wherever a client reaches for something that is not there, so the
+/// error it shows its model says what to do instead.
+const TOOLS_ONLY: &str = "This server provides tools only (no resources or prompts): \
+list_sessions, get_view, dispatch, capture_view. Start with the list_sessions tool.";
+
 const INSTRUCTIONS: &str = "\
 This server bridges to live user interfaces — hbui applications — that a person may be \
 using at the same time as you. Applications may be restarted at any moment (they are being \
@@ -75,6 +80,13 @@ impl Server {
             }),
             "ping" => json!({}),
             "tools/list" => json!({ "tools": tools() }),
+            // Everything here is a tool. Some clients ask for resources and
+            // prompts whatever the capabilities say; an empty list is the
+            // honest answer and lets them carry on to the tools, where a
+            // "method not found" makes them give up.
+            "resources/list" => json!({ "resources": [] }),
+            "resources/templates/list" => json!({ "resourceTemplates": [] }),
+            "prompts/list" => json!({ "prompts": [] }),
             "tools/call" => {
                 let params = req.params.unwrap_or(Value::Null);
                 match serde_json::from_value::<CallParams>(params) {
@@ -92,7 +104,7 @@ impl Server {
                 return Some(Response::error(
                     id,
                     METHOD_NOT_FOUND,
-                    format!("no method {other:?}"),
+                    format!("{NAME} has no method {other:?}. {TOOLS_ONLY}"),
                 ))
             }
         };
@@ -113,7 +125,7 @@ impl Server {
             other => CallResult::failure(&json!({
                 "ok": false,
                 "error": "unknown_tool",
-                "message": format!("no tool {other:?}"),
+                "message": format!("no tool {other:?}. {TOOLS_ONLY}"),
             })),
         }
     }
